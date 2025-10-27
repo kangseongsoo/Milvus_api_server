@@ -4,7 +4,7 @@
 from fastapi import APIRouter, HTTPException, status
 from app.models.search import SearchRequest, SearchResponse
 from app.utils.logger import setup_logger
-from app.core.partition_manager import partition_manager
+from app.core.redis_partition_manager import redis_partition_manager
 from app.core.embedding import embedding_service
 from app.core.milvus_client import milvus_client
 from app.core.postgres_client import postgres_client
@@ -39,11 +39,14 @@ async def search_documents(request: SearchRequest):
         
         # ========== Step 0: 파티션 로드 (검색 필수!) ==========
         logger.info(f"파티션 로드 확인: {partition_name}")
-        await partition_manager.ensure_partition_loaded(
+        await redis_partition_manager.ensure_partition_loaded(
             collection_name=collection_name,
             partition_name=partition_name
         )
         logger.info(f"파티션 로드 완료 (검색 가능)")
+        
+        # 파티션 접근 시간 업데이트 (TTL 정리용)
+        await redis_partition_manager.update_partition_access_time(collection_name, partition_name)
         
         # ========== Step 1: 쿼리 임베딩 생성 ==========
         embedding_start = datetime.now()

@@ -6,8 +6,9 @@ from fastapi.middleware.cors import CORSMiddleware
 from contextlib import asynccontextmanager
 from app.config import settings
 from app.api import collection, data, search
+from fastapi import APIRouter
 from app.utils.logger import setup_logger
-from app.core.partition_manager import partition_manager
+from app.core.redis_partition_manager import redis_partition_manager
 from app.core.auto_flusher import auto_flusher
 import asyncio
 
@@ -35,25 +36,25 @@ async def lifespan(app: FastAPI):
         # PostgreSQL 연결 테스트
         logger.info(f"✅ PostgreSQL Connected to ({settings.POSTGRES_HOST}:{settings.POSTGRES_PORT})")
         
-        # ⭐ 파티션 상태 동기화 (FastAPI 재시작 후 상태 불일치 해결)
-        logger.info("🔄 Syncing partition states with Milvus...")
+        # Redis 파티션 매니저 초기화
+        await redis_partition_manager.initialize()
+        logger.info("✅ Redis partition manager initialized")
+        
+        # ⭐ 파티션 상태 동기화 (Redis 기반)
+        logger.info("🔄 Syncing partition states with Milvus and Redis...")
         try:
-            sync_result = await partition_manager.sync_partition_states()
-            logger.info(f"✅ Partition state sync completed: {sync_result['partitions_synced']} partitions synced")
+            sync_result = await redis_partition_manager.sync_partition_states()
+            logger.info(f"✅ Redis partition state sync completed: {sync_result['partitions_synced']} partitions synced")
         except Exception as sync_error:
-            logger.warning(f"⚠️ Partition state sync failed: {sync_error}")
+            logger.warning(f"⚠️ Redis partition state sync failed: {sync_error}")
             logger.info("📦 Will continue with on-demand loading")
         
         # ⭐ 사전 로드 비활성화 (요청 시 동적 로드)
-        # collections_to_preload = ["collection_chatty"]
-        # logger.info(f"📦 Preloading {len(collections_to_preload)} collections...")
-        # tasks = [partition_manager.preload_collection(coll_name) for coll_name in collections_to_preload]
-        # await asyncio.gather(*tasks)
         logger.info("📦 Partition preload disabled - will load on-demand")
         
-        # 파티션 자동 정리 백그라운드 태스크 시작
-        cleanup_task = asyncio.create_task(partition_manager.auto_cleanup_loop())
-        logger.info(f"✅ Auto partition cleanup started (TTL: {settings.PARTITION_TTL_MINUTES}m, interval: {settings.CLEANUP_INTERVAL_SECONDS}s)")
+        # Redis 기반 파티션 자동 정리 백그라운드 태스크 시작
+        cleanup_task = asyncio.create_task(redis_partition_manager.auto_cleanup_loop())
+        logger.info(f"✅ Redis auto partition cleanup started (TTL: {settings.PARTITION_TTL_MINUTES}m, interval: {settings.CLEANUP_INTERVAL_SECONDS}s)")
         
         # 자동 flush 백그라운드 태스크 시작
         flush_task = asyncio.create_task(auto_flusher.start())
@@ -71,15 +72,19 @@ async def lifespan(app: FastAPI):
     logger.info("🛑 FastAPI Application Shutting Down...")
     
     try:
-        # 파티션 cleanup 중지
-        await partition_manager.stop_cleanup_loop()
+        # Redis 파티션 cleanup 중지
+        await redis_partition_manager.stop_cleanup_loop()
         if 'cleanup_task' in locals():
             cleanup_task.cancel()
             try:
                 await asyncio.wait_for(cleanup_task, timeout=2.0)
             except (asyncio.CancelledError, asyncio.TimeoutError):
                 pass
-        logger.info("✅ Partition cleanup stopped")
+        logger.info("✅ Redis partition cleanup stopped")
+        
+        # Redis 파티션 매니저 종료
+        await redis_partition_manager.shutdown()
+        logger.info("✅ Redis partition manager shutdown")
         
         # 자동 flush 중지
         await auto_flusher.stop()
@@ -134,6 +139,22 @@ app.include_router(collection.router, prefix="/collection", tags=["Collection"])
 app.include_router(data.router, prefix="/data", tags=["Data"])
 app.include_router(search.router, prefix="/search", tags=["Search"])
 
+# 디버깅용 라우터
+debug_router = APIRouter()
+
+@debug_router.get("/partitions/status")
+async def get_partition_status():
+    """파티션 상태 확인 (디버깅용)"""
+    return await redis_partition_manager.get_status()
+
+@debug_router.post("/partitions/cleanup")
+async def trigger_cleanup():
+    """수동으로 정리 실행 (디버깅용)"""
+    await redis_partition_manager._cleanup_by_ttl()
+    return {"message": "Redis cleanup triggered"}
+
+app.include_router(debug_router, prefix="/debug", tags=["Debug"])
+
 
 
 
@@ -150,7 +171,7 @@ async def root():
 @app.get("/health")
 async def health_check():
     """상세 헬스 체크 (파티션 통계 포함)"""
-    partition_stats = partition_manager.get_partition_stats()
+    partition_stats = await redis_partition_manager.get_status()
     
     return {
         "status": "healthy",

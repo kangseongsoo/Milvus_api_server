@@ -31,6 +31,13 @@ POSTGRES_DB_PREFIX=rag_db_
 # bot_id (UUID)를 테이블명으로 변환: bot_{uuid_without_hyphens}
 BOT_TABLE_PREFIX=bot_
 
+# Redis 설정 (파티션 상태 관리)
+REDIS_HOST=localhost
+REDIS_PORT=6379
+REDIS_PASSWORD=
+REDIS_DB=0
+REDIS_MAX_CONNECTIONS=10
+
 # 임베딩 모델 설정
 EMBEDDING_MODEL=openai  # openai, bge-m3, sentence-bert
 OPENAI_API_KEY=sk-your-api-key-here

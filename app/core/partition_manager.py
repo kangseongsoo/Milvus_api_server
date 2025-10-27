@@ -202,6 +202,13 @@ class MilvusPartitionManager:
         """파티션 로드 시간 조회"""
         return self.partition_load_time.get(partition_name)
     
+    def update_partition_access_time(self, collection_name: str, partition_name: str):
+        """파티션 접근 시간 업데이트 (TTL 정리용)"""
+        key = self._get_partition_key(collection_name, partition_name)
+        if self.is_partition_loaded(collection_name, partition_name):
+            self.last_access_time[key] = datetime.now()
+            logger.debug(f"🕒 Updated access time for partition: {key}")
+    
     def _get_partition_key(self, collection_name: str, partition_name: str) -> str:
         """파티션 고유 키 생성"""
         return f"{collection_name}/{partition_name}"
@@ -443,10 +450,17 @@ class MilvusPartitionManager:
         now = datetime.now()
         ttl_threshold = timedelta(minutes=settings.PARTITION_TTL_MINUTES)
         
+        # 디버깅: 현재 상태 로그
+        logger.info(f"🔍 Cleanup check: {len(self.last_access_time)} partitions tracked")
+        logger.info(f"🔍 Current time: {now}")
+        logger.info(f"🔍 TTL threshold: {ttl_threshold}")
+        
         to_unload = []
         
         for key, last_access in list(self.last_access_time.items()):
-            if now - last_access > ttl_threshold:
+            time_diff = now - last_access
+            logger.info(f"🔍 Partition {key}: last_access={last_access}, diff={time_diff}")
+            if time_diff > ttl_threshold:
                 to_unload.append(key)
         
         if to_unload:
@@ -458,6 +472,8 @@ class MilvusPartitionManager:
                     await self.unload_partition(collection_name, partition_name)
                 except Exception as e:
                     logger.error(f"❌ Failed to unload {key}: {e}")
+        else:
+            logger.info("🔍 No partitions to unload (TTL not expired)")
     
     async def _check_memory_and_cleanup(self):
         """메모리 임계값 체크 및 강제 정리"""

@@ -10,7 +10,10 @@ marshmallow>=3.13.0,<4.0.0
 
 # PostgreSQL 클라이언트
 asyncpg==0.29.0
-psycopg2-binary==2.9.9 
+psycopg2-binary==2.9.9
+
+# Redis 클라이언트
+redis[hiredis]==5.0.1 
 
 # 임베딩 모델
 openai==1.10.0  # OpenAI API
