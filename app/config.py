@@ -65,7 +65,7 @@ class Settings(BaseSettings):
     # 파티션 메모리 관리 설정
     PARTITION_TTL_MINUTES: int = 30  # 파티션 자동 언로드 시간 (분)
     MEMORY_THRESHOLD_PERCENT: float = 80.0  # 메모리 임계값 (%)
-    MAX_CONCURRENT_LOADS: int = 3  # 최대 동시 로드 개수
+    MAX_CONCURRENT_LOADS: int = 10  # 최대 동시 로드 개수
     CLEANUP_INTERVAL_SECONDS: int = 300  # 자동 정리 주기 (초, 5분)
     
     class Config:

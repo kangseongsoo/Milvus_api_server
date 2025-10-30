@@ -40,17 +40,14 @@ async def lifespan(app: FastAPI):
         await redis_partition_manager.initialize()
         logger.info("✅ Redis partition manager initialized")
         
-        # ⭐ 파티션 상태 동기화 (Redis 기반)
-        logger.info("🔄 Syncing partition states with Milvus and Redis...")
-        try:
-            sync_result = await redis_partition_manager.sync_partition_states()
-            logger.info(f"✅ Redis partition state sync completed: {sync_result['partitions_synced']} partitions synced")
-        except Exception as sync_error:
-            logger.warning(f"⚠️ Redis partition state sync failed: {sync_error}")
-            logger.info("📦 Will continue with on-demand loading")
+        # ⭐ 파티션 상태 동기화 비활성화
+        # 서버 시작 시 Milvus 상태를 동기화하지 않음
+        # 이유: 컬렉션이 로드되어 있으면 모든 파티션이 로드된 것으로 간주되어
+        #       언로드된 파티션도 다시 로드되는 문제 발생
+        logger.info("📦 Partition sync disabled - will load on-demand only")
         
-        # ⭐ 사전 로드 비활성화 (요청 시 동적 로드)
-        logger.info("📦 Partition preload disabled - will load on-demand")
+        # Redis에 저장된 파티션 상태는 유지됨 (서버 재시작 전 상태)
+        # 검색 시에만 파티션을 로드하고 TTL 관리
         
         # Redis 기반 파티션 자동 정리 백그라운드 태스크 시작
         cleanup_task = asyncio.create_task(redis_partition_manager.auto_cleanup_loop())

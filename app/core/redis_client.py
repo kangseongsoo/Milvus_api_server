@@ -112,9 +112,11 @@ class PartitionStateManager:
             })
             pipe.set(access_key, now.isoformat())
             pipe.set(load_key, now.isoformat())
-            pipe.expire(partition_key, 3600)  # 1시간 TTL
-            pipe.expire(access_key, 3600)
-            pipe.expire(load_key, 3600)
+            # Redis TTL: 24시간 (애플리케이션 TTL과 분리)
+            # 애플리케이션에서 30분 후 정리하지만, Redis 키는 24시간 유지
+            pipe.expire(partition_key, 86400)  # 24시간 TTL
+            pipe.expire(access_key, 86400)
+            pipe.expire(load_key, 86400)
             
             logger.info(f"🔄 Executing Redis pipeline for partition: {collection_name}/{partition_name}")
             result = await pipe.execute()
@@ -227,12 +229,12 @@ class PartitionStateManager:
             access_time = data.get("access_time")
             if access_time:
                 time_diff = now - access_time
-                logger.info(f"🔍 Partition {key}: access_time={access_time}, diff={time_diff}, threshold={ttl_threshold}")
+                # logger.info(f"🔍 Partition {key}: access_time={access_time}, diff={time_diff}, threshold={ttl_threshold}")
                 if time_diff > ttl_threshold:
                     expired.append(key)
-                    logger.info(f"🔍 Partition {key} is EXPIRED")
-                else:
-                    logger.info(f"🔍 Partition {key} is NOT expired")
+                    # logger.info(f"🔍 Partition {key} is EXPIRED")
+                # else:
+                #     logger.info(f"🔍 Partition {key} is NOT expired")
             else:
                 logger.warning(f"🔍 Partition {key} has no access_time")
                 

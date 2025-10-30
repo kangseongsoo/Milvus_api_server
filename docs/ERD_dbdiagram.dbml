@@ -1,0 +1,216 @@
+// Milvus + PostgreSQL RAG 시스템 ERD
+// DBdiagram.io에서 시각화 가능
+
+Project Milvus_RAG_API {
+  database_type: 'PostgreSQL'
+  Note: '''
+    # 🗄️ Milvus + PostgreSQL RAG 시스템 ERD
+    
+    ## 📊 시스템 개요
+    - **PostgreSQL**: 메타데이터 및 문서 관리 (파티셔닝)
+    - **Milvus**: 벡터 임베딩 검색 (파티셔닝)
+    - **계정 레벨**: chatty → collection_chatty + rag_db_chatty
+    - **봇 레벨**: bot_id → PostgreSQL 파티션 + Milvus 파티션
+    
+    ## 🎯 핵심 특징
+    - 파티션 프루닝으로 3억 건도 300만 건처럼 빠르게!
+    - 완벽한 대칭 구조 (PostgreSQL ↔ Milvus)
+    - 문서 고유 식별자(content_name)로 삭제 지원
+  '''
+}
+
+// =============================================
+// PostgreSQL 테이블 구조
+// =============================================
+
+Table bot_registry {
+  bot_id varchar(100) [pk, note: 'UUID 봇 ID']
+  bot_name varchar(255) [not null, note: '봇 이름']
+  partition_name varchar(255) [unique, not null, note: 'Milvus 파티션명']
+  description text [note: '봇 설명']
+  created_at timestamp [default: `now()`, note: '생성 시간']
+  metadata jsonb [note: '추가 메타데이터']
+  
+  Note: '''
+    # 봇 레지스트리
+    - 각 봇의 기본 정보와 Milvus 파티션명 매핑
+    - 예시: 550e8400-... → bot_550e8400e29b41d4a716446655440000
+  '''
+}
+
+Table documents {
+  doc_id bigserial [pk, note: '문서 ID (시퀀스)']
+  chat_bot_id varchar(100) [ref: > bot_registry.bot_id, note: '봇 ID (파티션 키)']
+  content_name varchar(500) [unique, not null, note: '문서 고유 식별자 (URL, 파일명, 제목 등)']
+  chunk_count int [default: 0, note: '총 청크 수']
+  created_at timestamp [default: `now()`, note: '생성 시간']
+  updated_at timestamp [default: `now()`, note: '수정 시간']
+  metadata jsonb [note: '상세 메타데이터 (모든 정보 저장)']
+  
+  Note: '''
+    # 문서 테이블 (파티셔닝)
+    - chat_bot_id로 파티셔닝
+    - content_name으로 고유 문서 식별 및 삭제
+    - 파티션 예시: documents_550e8400e29b41d4a716446655440000
+  '''
+}
+
+Table document_chunks {
+  chunk_id bigserial [pk, note: '청크 ID']
+  doc_id bigint [ref: > documents.doc_id, note: '문서 ID']
+  chat_bot_id varchar(100) [ref: > bot_registry.bot_id, note: '봇 ID (파티션 키)']
+  chunk_index int [not null, note: '청크 순서']
+  chunk_text text [not null, note: '청크 텍스트']
+  created_at timestamp [default: `now()`, note: '생성 시간']
+  
+  Note: '''
+    # 청크 테이블 (파티셔닝)
+    - chat_bot_id로 파티셔닝
+    - doc_id + chat_bot_id로 documents와 연결
+    - 파티션 예시: document_chunks_550e8400e29b41d4a716446655440000
+  '''
+}
+
+// =============================================
+// Milvus 컬렉션 스키마 (가상 테이블로 표현)
+// =============================================
+
+Table collection_chatty {
+  id int64 [pk, note: '자동 증가 ID']
+  chat_bot_id varchar [note: '봇 ID (필터링용)']
+  content_name varchar [note: '문서 고유 식별자']
+  doc_id int64 [note: '문서 ID (PostgreSQL FK)']
+  chunk_index int64 [note: '청크 인덱스']
+  embedding_dense float_vector [note: 'Dense 임베딩 벡터 (1536차원)']
+  embedding_sparse float_vector [note: 'Sparse 임베딩 벡터 (향후 고도화용)']
+  metadata json [note: '메타데이터 (expr 필터링용)']
+  
+  Note: '''
+    # Milvus 컬렉션: collection_chatty
+    
+    ## 파티션 구조
+    - bot_550e8400e29b41d4a716446655440000 (뉴스봇 벡터)
+    - bot_7c9e6679742540de944be07fc1f90ae7 (법률봇 벡터)
+    - bot_8a7f5678823451efb345567890abcdef (의료봇 벡터)
+    
+    ## 인덱스
+    - embedding_dense: HNSW (COSINE) - 의미적 검색
+    - embedding_sparse: SPARSE_INVERTED_INDEX (IP) - 키워드 검색
+  '''
+}
+
+// =============================================
+// 관계 정의
+// =============================================
+
+Ref: documents.chat_bot_id > bot_registry.bot_id [delete: cascade]
+Ref: document_chunks.doc_id > documents.doc_id [delete: cascade]
+Ref: document_chunks.chat_bot_id > bot_registry.bot_id [delete: cascade]
+
+// Milvus와 PostgreSQL 간의 논리적 연결 (실제 FK는 아님)
+Ref: collection_chatty.chat_bot_id - bot_registry.bot_id [note: '봇 식별 매핑']
+Ref: collection_chatty.content_name - documents.content_name [note: '문서 고유 식별자']
+Ref: collection_chatty.doc_id - documents.doc_id [note: '문서 연결']
+
+// =============================================
+// 인덱스 정의
+// =============================================
+
+TableGroup "PostgreSQL 인덱스" {
+  Table documents {
+    index idx_documents_chat_bot_created [chat_bot_id, created_at]
+    index idx_documents_content_name [content_name]
+    index idx_documents_metadata [metadata] [type: gin]
+  }
+  
+  Table document_chunks {
+    index idx_chunks_doc_bot [doc_id, chat_bot_id]
+    index idx_chunks_index [chunk_index]
+  }
+}
+
+TableGroup "Milvus 인덱스" {
+  Table collection_chatty {
+    index idx_dense_embedding [embedding_dense] [type: hnsw, note: 'HNSW (COSINE)']
+    index idx_sparse_embedding [embedding_sparse] [type: sparse_inverted, note: 'SPARSE_INVERTED_INDEX (IP)']
+  }
+}
+
+// =============================================
+// 파티션 정보
+// =============================================
+
+TableGroup "PostgreSQL 파티션" {
+  Table documents_partition_news {
+    doc_id bigserial [pk]
+    chat_bot_id varchar(100) [note: '550e8400-e29b-41d4-a716-446655440000']
+    content_name varchar(500)
+    chunk_count int
+    created_at timestamp
+    updated_at timestamp
+    metadata jsonb
+    
+    Note: '''
+      # documents_550e8400e29b41d4a716446655440000
+      뉴스봇 문서 파티션
+    '''
+  }
+  
+  Table document_chunks_partition_news {
+    chunk_id bigserial [pk]
+    doc_id bigint
+    chat_bot_id varchar(100) [note: '550e8400-e29b-41d4-a716-446655440000']
+    chunk_index int
+    chunk_text text
+    created_at timestamp
+    
+    Note: '''
+      # document_chunks_550e8400e29b41d4a716446655440000
+      뉴스봇 청크 파티션
+    '''
+  }
+}
+
+TableGroup "Milvus 파티션" {
+  Table milvus_partition_news {
+    id int64 [pk]
+    chat_bot_id varchar [note: '550e8400-e29b-41d4-a716-446655440000']
+    content_name varchar
+    doc_id int64
+    chunk_index int64
+    embedding_dense float_vector
+    embedding_sparse float_vector
+    metadata json
+    
+    Note: '''
+      # collection_chatty/bot_550e8400e29b41d4a716446655440000
+      뉴스봇 벡터 파티션
+    '''
+  }
+}
+
+// =============================================
+// 데이터 흐름 및 매핑
+// =============================================
+
+TableGroup "시스템 매핑" {
+  Table mapping_table {
+    postgres_table varchar [note: 'PostgreSQL 테이블']
+    milvus_collection varchar [note: 'Milvus 컬렉션/파티션']
+    connection_key varchar [note: '연결 키']
+    purpose varchar [note: '용도']
+    
+    Note: '''
+      # PostgreSQL ↔ Milvus 매핑 관계
+      
+      | PostgreSQL | Milvus | 연결 키 | 용도 |
+      |-----------|--------|---------|------|
+      | bot_registry.bot_id | collection_chatty[partition].chat_bot_id | 봇 식별 | 봇 식별 |
+      | bot_registry.partition_name | collection_chatty[partition_name] | 파티션 매핑 | 파티션 매핑 ⭐ |
+      | documents.content_name | collection_chatty.content_name | 문서 고유 식별자 | 문서 식별 |
+      | documents.doc_id | collection_chatty.doc_id | 문서 연결 | 문서 연결 |
+      | document_chunks.chunk_index | collection_chatty.chunk_index | 청크 순서 | 청크 순서 |
+      | document_chunks.chunk_text | collection_chatty.embedding_dense | 임베딩 변환 | 벡터 검색 |
+    '''
+  }
+}

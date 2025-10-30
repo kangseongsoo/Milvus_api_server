@@ -33,6 +33,7 @@ class SearchResultItem(BaseModel):
 class SearchResponse(BaseModel):
     """검색 응답"""
     status: str = Field(..., description="상태", example="success")
+    partition_load_time_ms: float = Field(..., description="파티션 로드 시간 (ms)")
     vector_search_time_ms: float = Field(..., description="벡터 검색 시간 (ms)")
     postgres_query_time_ms: float = Field(..., description="PostgreSQL 조회 시간 (ms)")
     total_time_ms: float = Field(..., description="총 처리 시간 (ms)")

@@ -38,12 +38,16 @@ async def search_documents(request: SearchRequest):
         logger.info(f"검색 요청 (account: {request.account_name}, bot: {request.chat_bot_id}): '{request.query_text}', limit={request.limit}")
         
         # ========== Step 0: 파티션 로드 (검색 필수!) ==========
+        partition_load_start = datetime.now()
         logger.info(f"파티션 로드 확인: {partition_name}")
+        
         await redis_partition_manager.ensure_partition_loaded(
             collection_name=collection_name,
             partition_name=partition_name
         )
-        logger.info(f"파티션 로드 완료 (검색 가능)")
+        
+        partition_load_time = (datetime.now() - partition_load_start).total_seconds() * 1000
+        logger.info(f"✅ 파티션 로드 완료: {partition_load_time:.2f}ms (검색 가능)")
         
         # 파티션 접근 시간 업데이트 (TTL 정리용)
         await redis_partition_manager.update_partition_access_time(collection_name, partition_name)
@@ -100,13 +104,14 @@ async def search_documents(request: SearchRequest):
             # 검색 결과 처리
             if not search_results or not search_results[0]:
                 logger.info("검색 결과 없음")
+                total_time = (datetime.now() - partition_load_start).total_seconds() * 1000
                 return SearchResponse(
                     status="success",
-                    query=request.query_text,
-                    total_results=0,
-                    results=[],
-                    search_time_ms=search_time,
-                    embedding_time_ms=embedding_time
+                    partition_load_time_ms=partition_load_time,
+                    vector_search_time_ms=search_time + embedding_time,
+                    postgres_query_time_ms=0.0,
+                    total_time_ms=total_time,
+                    results=[]
                 )
             
             # 결과 파싱
@@ -148,13 +153,13 @@ async def search_documents(request: SearchRequest):
             logger.info(f"PostgreSQL 메타데이터 조회 완료: {postgres_time:.2f}ms")
             
             # 디버깅: documents 구조 확인
-            logger.info(f"PostgreSQL 결과 타입: {type(documents)}, 개수: {len(documents) if documents else 0}")
-            if documents and len(documents) > 0:
-                logger.info(f"첫 번째 문서 타입: {type(documents[0])}")
-                if isinstance(documents[0], dict):
-                    logger.info(f"첫 번째 문서 키: {list(documents[0].keys())}")
-                else:
-                    logger.info(f"첫 번째 문서 내용: {str(documents[0])[:100]}...")
+            #logger.info(f"PostgreSQL 결과 타입: {type(documents)}, 개수: {len(documents) if documents else 0}")
+            #if documents and len(documents) > 0:
+            #    logger.info(f"첫 번째 문서 타입: {type(documents[0])}")
+            #    if isinstance(documents[0], dict):
+            #        logger.info(f"첫 번째 문서 키: {list(documents[0].keys())}")
+            #    else:
+            #        logger.info(f"첫 번째 문서 내용: {str(documents[0])[:100]}...")
             
         except Exception as postgres_error:
             logger.error(f"PostgreSQL 조회 실패: {str(postgres_error)}")
@@ -201,13 +206,15 @@ async def search_documents(request: SearchRequest):
                     })
             
             # 시간 계산
-            total_time = (datetime.now() - search_start).total_seconds() * 1000
+            total_time = (datetime.now() - partition_load_start).total_seconds() * 1000
             vector_search_time = search_time + embedding_time
             
             logger.info(f"검색 완료: {len(results)}개 결과")
+            logger.info(f"⏱️  시간 측정 - 파티션 로드: {partition_load_time:.2f}ms, 벡터 검색: {vector_search_time:.2f}ms, PostgreSQL: {postgres_time:.2f}ms, 총: {total_time:.2f}ms")
             
             return SearchResponse(
                 status="success",
+                partition_load_time_ms=partition_load_time,
                 vector_search_time_ms=vector_search_time,
                 postgres_query_time_ms=postgres_time,
                 total_time_ms=total_time,
