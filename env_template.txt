@@ -1,55 +1,67 @@
 # 이 파일을 .env로 복사하여 사용하세요
 # cp env_template.txt .env
 
-# 서버 설정
-HOST=0.0.0.0
-PORT=8000
+# ========================================
+# 민감한 정보만 .env에 설정하세요
+# 나머지 설정은 app/config.py에서 관리됩니다
+# ========================================
 
-# Milvus 설정 (계정별 컬렉션 + 봇별 파티셔닝)
-MILVUS_HOST=localhost
-MILVUS_PORT=19530
-MILVUS_USER=
-MILVUS_PASSWORD=
-
-# Milvus 컬렉션 네이밍
-# 예: account_name=chatty → collection_chatty
-#     account_name=enterprise → collection_enterprise
-MILVUS_COLLECTION_PREFIX=collection_
-
-# PostgreSQL 설정 (계정별 DB + 봇별 파티셔닝)
-POSTGRES_HOST=localhost
-POSTGRES_PORT=5432
-POSTGRES_USER=postgres
-POSTGRES_PASSWORD=password
-
-# PostgreSQL DB 네이밍
-# 예: account_name=chatty → rag_db_chatty
-#     account_name=enterprise → rag_db_enterprise
-POSTGRES_DB_PREFIX=rag_db_
-
-# 봇별 테이블 네이밍
-# bot_id (UUID)를 테이블명으로 변환: bot_{uuid_without_hyphens}
-BOT_TABLE_PREFIX=bot_
-
-# Redis 설정 (파티션 상태 관리)
-REDIS_HOST=localhost
-REDIS_PORT=6379
-REDIS_PASSWORD=
-REDIS_DB=0
-REDIS_MAX_CONNECTIONS=10
-
-# 임베딩 모델 설정
-EMBEDDING_MODEL=openai  # openai, bge-m3, sentence-bert
+# OpenAI API Key (필수)
 OPENAI_API_KEY=sk-your-api-key-here
-EMBEDDING_DIMENSION=1536
 
-# 하이브리드 검색 설정 (향후 고도화용)
-USE_SPARSE_EMBEDDING=fasle
+# ========================================
+# 아래 설정들은 config.py에서 관리됩니다
+# 필요시에만 .env에서 오버라이드하세요
+# ========================================
 
-# 로깅 설정
-LOG_LEVEL=INFO
+# # 서버 설정
+# HOST=0.0.0.0
+# PORT=8000
 
-# 성능 설정
-MAX_BATCH_SIZE=100
-CONNECTION_POOL_SIZE=10
+# # Milvus 설정 (계정별 컬렉션 + 봇별 파티셔닝)
+# MILVUS_HOST=localhost
+# MILVUS_PORT=19530
+# MILVUS_USER=
+# MILVUS_PASSWORD=
+
+# # Milvus 컬렉션 네이밍
+# # 예: account_name=chatty → collection_chatty
+# #     account_name=enterprise → collection_enterprise
+# MILVUS_COLLECTION_PREFIX=collection_
+
+# # PostgreSQL 설정 (계정별 DB + 봇별 파티셔닝)
+# POSTGRES_HOST=localhost
+# POSTGRES_PORT=5432
+# POSTGRES_USER=postgres
+# POSTGRES_PASSWORD=password
+
+# # PostgreSQL DB 네이밍
+# # 예: account_name=chatty → rag_db_chatty
+# #     account_name=enterprise → rag_db_enterprise
+# POSTGRES_DB_PREFIX=rag_db_
+
+# # 봇별 테이블 네이밍
+# # bot_id (UUID)를 테이블명으로 변환: bot_{uuid_without_hyphens}
+# BOT_TABLE_PREFIX=bot_
+
+# # Redis 설정 (파티션 상태 관리)
+# REDIS_HOST=localhost
+# REDIS_PORT=6379
+# REDIS_PASSWORD=
+# REDIS_DB=0
+# REDIS_MAX_CONNECTIONS=10
+
+# # 임베딩 모델 설정
+# EMBEDDING_MODEL=openai  # openai, bge-m3, sentence-bert
+# EMBEDDING_DIMENSION=1536
+
+# # 하이브리드 검색 설정 (향후 고도화용)
+# USE_SPARSE_EMBEDDING=false
+
+# # 로깅 설정
+# LOG_LEVEL=INFO
+
+# # 성능 설정
+# MAX_BATCH_SIZE=100
+# CONNECTION_POOL_SIZE=10
 

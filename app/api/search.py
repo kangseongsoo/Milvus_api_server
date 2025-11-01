@@ -41,22 +41,51 @@ async def search_documents(request: SearchRequest):
         partition_load_start = datetime.now()
         logger.info(f"파티션 로드 확인: {partition_name}")
         
-        await redis_partition_manager.ensure_partition_loaded(
-            collection_name=collection_name,
-            partition_name=partition_name
-        )
+        # 검색 시 컬렉션 로드 상태 확인하여 적절히 로드
+        from pymilvus import utility, Collection
+        collection_obj = Collection(name=collection_name)
+        
+        try:
+            collection_load_state = utility.load_state(collection_name)
+            collection_is_loaded = (collection_load_state == utility.LoadState.Loaded)
+        except Exception:
+            collection_is_loaded = False
+        
+        if collection_is_loaded:
+            # 컬렉션이 이미 로드되어 있으면 기존 방식대로 파티션만 로드
+            await redis_partition_manager.ensure_partition_loaded(
+                collection_name=collection_name,
+                partition_name=partition_name
+            )
+        else:
+            # 컬렉션이 언로드되어 있으면 컬렉션을 로드하면서 특정 파티션만 선택적으로 로드
+            logger.info(f"Collection {collection_name} is not loaded, loading collection with partition: {partition_name}")
+            collection_obj.load(partition_names=[partition_name])
+            logger.info(f"✅ Collection {collection_name} loaded with partition {partition_name}")
+            
+            # Redis에 상태 저장 및 접근 시간 업데이트
+            from app.core.redis_client import redis_client
+            partition_state_manager = redis_partition_manager._partition_state_manager
+            await partition_state_manager.set_partition_loaded(collection_name, partition_name)
+            await partition_state_manager.update_access_time(collection_name, partition_name)
         
         partition_load_time = (datetime.now() - partition_load_start).total_seconds() * 1000
         logger.info(f"✅ 파티션 로드 완료: {partition_load_time:.2f}ms (검색 가능)")
         
-        # 파티션 접근 시간 업데이트 (TTL 정리용)
-        await redis_partition_manager.update_partition_access_time(collection_name, partition_name)
+        # ========== Step 0.5: 쿼리 검증 ==========
+        # 빈 문자열 또는 공백만 있는 경우 에러
+        if not request.query_text or not request.query_text.strip():
+            logger.warning(f"빈 검색 쿼리 요청: '{request.query_text}'")
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Query text is empty or contains only whitespace"
+            )
         
         # ========== Step 1: 쿼리 임베딩 생성 ==========
         embedding_start = datetime.now()
         
         try:
-            query_vector = await embedding_service.embed(request.query_text)
+            query_vector = await embedding_service.embed(request.query_text.strip())
             embedding_time = (datetime.now() - embedding_start).total_seconds() * 1000
             logger.info(f"쿼리 임베딩 완료: {embedding_time:.2f}ms")
         except Exception as embedding_error:
@@ -79,7 +108,7 @@ async def search_documents(request: SearchRequest):
             }
             
             # 필터 표현식 구성
-            base_expr = f"chat_bot_id == '{request.chat_bot_id}'"
+            base_expr = f'chat_bot_id == "{request.chat_bot_id}"'
             if request.filter_expr:
                 expr = f"{base_expr} and {request.filter_expr}"
             else:
@@ -142,6 +171,8 @@ async def search_documents(request: SearchRequest):
             # 고유한 doc_id만 조회
             unique_doc_ids = list(set(doc_ids))
             unique_chunk_indices = list(set(chunk_indices))
+            logger.info(f"PostgreSQL 문서 조회 시작: {len(unique_doc_ids)}개 doc_id, {len(unique_chunk_indices)}개 chunk_index")
+            
             documents = await postgres_client.get_documents_with_chunks_by_ids(
                 account_name=request.account_name,
                 chat_bot_id=request.chat_bot_id,
@@ -150,7 +181,13 @@ async def search_documents(request: SearchRequest):
             )
             
             postgres_time = (datetime.now() - postgres_start).total_seconds() * 1000
-            logger.info(f"PostgreSQL 메타데이터 조회 완료: {postgres_time:.2f}ms")
+            logger.info(f"PostgreSQL 메타데이터 조회 완료: {postgres_time:.2f}ms, {len(documents)}개 문서 발견")
+            
+            # PostgreSQL에서 찾지 못한 doc_id 로깅
+            found_doc_ids = {doc["doc_id"] for doc in documents}
+            missing_doc_ids = set(unique_doc_ids) - found_doc_ids
+            if missing_doc_ids:
+                logger.warning(f"⚠️ PostgreSQL에서 문서를 찾지 못한 doc_id: {missing_doc_ids} (Milvus에는 있지만 PostgreSQL에는 없음 - 데이터 불일치 가능성)")
             
             # 디버깅: documents 구조 확인
             #logger.info(f"PostgreSQL 결과 타입: {type(documents)}, 개수: {len(documents) if documents else 0}")
@@ -173,8 +210,10 @@ async def search_documents(request: SearchRequest):
             # 문서 메타데이터를 딕셔너리로 변환 (documents는 딕셔너리 리스트)
             doc_metadata = {doc["doc_id"]: doc for doc in documents}
             
-            # 검색 결과 구성
+            # 검색 결과 구성 (PostgreSQL에 존재하는 문서만 포함)
             results = []
+            skipped_count = 0  # PostgreSQL에 없는 문서 수
+            
             for i, (doc_id, score, chunk_index) in enumerate(zip(doc_ids, scores, chunk_indices)):
                 doc_info = doc_metadata.get(doc_id)
                 
@@ -204,12 +243,19 @@ async def search_documents(request: SearchRequest):
                             "metadata": metadata
                         }
                     })
+                else:
+                    # PostgreSQL에 문서가 없는 경우 제외
+                    skipped_count += 1
+                    logger.debug(f"PostgreSQL에서 문서를 찾지 못함: doc_id={doc_id}, chunk_index={chunk_index} (검색 결과에서 제외)")
+            
+            if skipped_count > 0:
+                logger.warning(f"⚠️ 검색 결과에서 {skipped_count}개 문서 제외됨 (PostgreSQL에 존재하지 않음 - Milvus와 데이터 불일치)")
             
             # 시간 계산
             total_time = (datetime.now() - partition_load_start).total_seconds() * 1000
             vector_search_time = search_time + embedding_time
             
-            logger.info(f"검색 완료: {len(results)}개 결과")
+            logger.info(f"검색 완료: {len(results)}개 결과 반환 (Milvus에서 {len(hits)}개 발견, PostgreSQL에서 {len(documents)}개 존재, {skipped_count}개 제외)")
             logger.info(f"⏱️  시간 측정 - 파티션 로드: {partition_load_time:.2f}ms, 벡터 검색: {vector_search_time:.2f}ms, PostgreSQL: {postgres_time:.2f}ms, 총: {total_time:.2f}ms")
             
             return SearchResponse(

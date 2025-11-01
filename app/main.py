@@ -40,14 +40,14 @@ async def lifespan(app: FastAPI):
         await redis_partition_manager.initialize()
         logger.info("✅ Redis partition manager initialized")
         
-        # ⭐ 파티션 상태 동기화 비활성화
-        # 서버 시작 시 Milvus 상태를 동기화하지 않음
-        # 이유: 컬렉션이 로드되어 있으면 모든 파티션이 로드된 것으로 간주되어
-        #       언로드된 파티션도 다시 로드되는 문제 발생
-        logger.info("📦 Partition sync disabled - will load on-demand only")
-        
-        # Redis에 저장된 파티션 상태는 유지됨 (서버 재시작 전 상태)
-        # 검색 시에만 파티션을 로드하고 TTL 관리
+        # ⭐ 프로그램 시작 시 Redis에 저장된 파티션들 다시 로드
+        logger.info("📦 Reloading partitions from Redis...")
+        try:
+            reload_result = await redis_partition_manager.reload_partitions_from_redis()
+            logger.info(f"✅ Partition reload completed: {reload_result.get('partitions_reloaded', 0)} partitions reloaded")
+        except Exception as reload_error:
+            logger.error(f"❌ Failed to reload partitions from Redis: {reload_error}")
+            # 에러가 발생해도 서버는 계속 시작하도록 함
         
         # Redis 기반 파티션 자동 정리 백그라운드 태스크 시작
         cleanup_task = asyncio.create_task(redis_partition_manager.auto_cleanup_loop())
@@ -149,6 +149,47 @@ async def trigger_cleanup():
     """수동으로 정리 실행 (디버깅용)"""
     await redis_partition_manager._cleanup_by_ttl()
     return {"message": "Redis cleanup triggered"}
+
+@debug_router.get("/count/{collection_name}")
+async def count_entities(collection_name: str):
+    """컬렉션 및 파티션별 벡터 개수 확인 (디버깅용)"""
+    from pymilvus import Collection
+    try:
+        collection = Collection(name=collection_name)
+        collection.flush()  # 최신 데이터 반영
+        
+        # 전체 개수
+        total = collection.num_entities
+        
+        # 파티션별 개수
+        partition_counts = {}
+        for partition in collection.partitions:
+            try:
+                count = partition.num_entities
+                partition_counts[partition.name] = count
+            except Exception as e:
+                partition_counts[partition.name] = f"Error: {str(e)}"
+        
+        return {
+            "collection": collection_name,
+            "total_entities": total,
+            "partitions": partition_counts,
+            "status": "success"
+        }
+    except Exception as e:
+        return {"message": str(e), "status": "error"}
+
+@debug_router.post("/flush/{collection_name}")
+async def manual_flush(collection_name: str):
+    """수동 flush 실행 (디버깅용)"""
+    from pymilvus import Collection
+    try:
+        collection = Collection(name=collection_name)
+        collection.load()  # 컬렉션 로드
+        collection.flush()  # Flush
+        return {"message": f"Flushed {collection_name}", "status": "success"}
+    except Exception as e:
+        return {"message": str(e), "status": "error"}
 
 app.include_router(debug_router, prefix="/debug", tags=["Debug"])
 

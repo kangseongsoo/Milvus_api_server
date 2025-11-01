@@ -20,7 +20,7 @@ class EmbeddingService:
             if not settings.OPENAI_API_KEY:
                 raise ValueError("OPENAI_API_KEY가 설정되지 않았습니다.")
             self.client = AsyncOpenAI(api_key=settings.OPENAI_API_KEY)
-            self.model_name = "text-embedding-3-small"
+            self.model_name = "text-embedding-ada-002"
         
         logger.info(f"임베딩 서비스 초기화: {self.model_type}")
     

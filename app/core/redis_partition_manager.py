@@ -136,6 +136,129 @@ class RedisMilvusPartitionManager:
             logger.error(f"❌ Failed to unload partition {key}: {e}")
             return False
     
+    async def reload_partitions_from_redis(self) -> Dict[str, Any]:
+        """
+        프로그램 시작 시 Redis에 저장된 파티션들을 다시 로드
+        
+        Returns:
+            로드 결과 통계
+        """
+        try:
+            logger.info("🔄 Starting partition reload from Redis...")
+            start_time = datetime.now()
+            
+            # Redis에서 활성화된 파티션 목록 가져오기
+            all_partitions = await self._partition_state_manager.get_all_loaded_partitions()
+            
+            if not all_partitions:
+                logger.info("📦 No partitions found in Redis - nothing to reload")
+                return {
+                    "partitions_found": 0,
+                    "partitions_reloaded": 0,
+                    "collections_loaded": 0,
+                    "reload_time_seconds": 0
+                }
+            
+            logger.info(f"📦 Found {len(all_partitions)} partitions in Redis to reload")
+            
+            # 컬렉션별로 파티션 그룹화
+            partitions_by_collection: Dict[str, List[str]] = {}
+            partition_access_data: Dict[str, Dict[str, Any]] = {}
+            
+            for partition_key, partition_data in all_partitions.items():
+                collection_name = partition_data.get("collection")
+                partition_name = partition_data.get("partition")
+                
+                if not collection_name or not partition_name:
+                    logger.warning(f"⚠️ Invalid partition data: {partition_key}")
+                    continue
+                
+                if collection_name not in partitions_by_collection:
+                    partitions_by_collection[collection_name] = []
+                partitions_by_collection[collection_name].append(partition_name)
+                partition_access_data[f"{collection_name}/{partition_name}"] = partition_data
+            
+            logger.info(f"📦 Grouped into {len(partitions_by_collection)} collections")
+            
+            reloaded_count = 0
+            collections_loaded_count = 0
+            skipped_count = 0
+            
+            from pymilvus import utility, Collection
+            
+            # 컬렉션별로 처리
+            for collection_name, partition_names in partitions_by_collection.items():
+                try:
+                    logger.info(f"🔍 Processing collection: {collection_name} ({len(partition_names)} partitions)")
+                    
+                    collection = Collection(name=collection_name)
+                    
+                    # 1. 컬렉션 로드 상태 확인
+                    try:
+                        collection_load_state = utility.load_state(collection_name)
+                        collection_is_loaded = (collection_load_state == utility.LoadState.Loaded)
+                    except Exception:
+                        collection_is_loaded = False
+                    
+                    if collection_is_loaded:
+                        # 2. 컬렉션이 로드됨 → 각 파티션 로드 상태 확인 및 로드
+                        logger.info(f"   → Collection is loaded, checking partitions individually")
+                        for partition_name in partition_names:
+                            try:
+                                try:
+                                    partition_load_state = utility.load_state(collection_name, partition_name)
+                                    partition_is_loaded = (partition_load_state == utility.LoadState.Loaded)
+                                except Exception:
+                                    partition_is_loaded = False
+                                
+                                if not partition_is_loaded:
+                                    # 3. 파티션이 로드 안되어있다면 로드
+                                    logger.info(f"   → Partition {partition_name} not loaded, loading partition only")
+                                    partition = collection.partition(partition_name)
+                                    partition.load()
+                                    reloaded_count += 1
+                                    logger.info(f"   ✅ Partition reloaded: {partition_name}")
+                                else:
+                                    logger.info(f"   → Partition {partition_name} already loaded, skipping")
+                                    skipped_count += 1
+                            except Exception as partition_error:
+                                logger.error(f"   ❌ Failed to reload partition {collection_name}/{partition_name}: {partition_error}")
+                                continue
+                    else:
+                        # 4. 컬렉션이 로드 안되어있다면 collection.load(partition_names=[...])으로 한 번에 로드
+                        logger.info(f"   → Collection not loaded, loading collection with {len(partition_names)} partitions")
+                        collection.load(partition_names=partition_names)
+                        collections_loaded_count += 1
+                        reloaded_count += len(partition_names)
+                        logger.info(f"   ✅ Collection loaded with {len(partition_names)} partitions")
+                    
+                    # 모든 파티션 접근 시간 업데이트 (컬렉션 로드 여부와 무관하게 한 번에)
+                    for partition_name in partition_names:
+                        await self._partition_state_manager.update_access_time(collection_name, partition_name)
+                    
+                except Exception as collection_error:
+                    logger.error(f"   ❌ Failed to process collection {collection_name}: {collection_error}")
+                    continue
+            
+            elapsed_time = (datetime.now() - start_time).total_seconds()
+            logger.info(f"✅ Partition reload from Redis completed in {elapsed_time:.2f}s")
+            logger.info(f"   - Partitions found: {len(all_partitions)}")
+            logger.info(f"   - Partitions reloaded: {reloaded_count}")
+            logger.info(f"   - Collections loaded: {collections_loaded_count}")
+            logger.info(f"   - Partitions skipped (already loaded): {skipped_count}")
+            
+            return {
+                "partitions_found": len(all_partitions),
+                "partitions_reloaded": reloaded_count,
+                "collections_loaded": collections_loaded_count,
+                "partitions_skipped": skipped_count,
+                "reload_time_seconds": elapsed_time
+            }
+            
+        except Exception as e:
+            logger.error(f"❌ Failed to reload partitions from Redis: {e}")
+            raise
+    
     async def sync_partition_states(self, collection_names: List[str] = None) -> Dict[str, Any]:
         """
         Milvus 파티션 상태와 Redis 동기화

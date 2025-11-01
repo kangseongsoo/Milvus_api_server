@@ -3,6 +3,7 @@
 환경변수 로드 및 전역 설정
 """
 from pydantic_settings import BaseSettings
+from pydantic import field_validator
 from typing import Optional
 
 
@@ -26,7 +27,7 @@ class Settings(BaseSettings):
     POSTGRES_HOST: str = "localhost"
     POSTGRES_PORT: int = 5432
     POSTGRES_USER: str = "postgres"
-    POSTGRES_PASSWORD: str = "password"
+    POSTGRES_PASSWORD: str = "dktkekf0215@#"
     
     # DB 네이밍 (계정별 데이터베이스)
     POSTGRES_DB_PREFIX: str = "rag_db_"  # 예: rag_db_chatty, rag_db_enterprise
@@ -48,7 +49,7 @@ class Settings(BaseSettings):
     EMBEDDING_DIMENSION: int = 1536
     
     # 하이브리드 검색 설정 (향후 고도화용)
-    USE_SPARSE_EMBEDDING: bool  # .env에서 설정 (USE_SPARSE_EMBEDDING=true/false)
+    USE_SPARSE_EMBEDDING: bool = False  # .env에서 설정 (USE_SPARSE_EMBEDDING=true/false)
     
     # 로깅 설정
     LOG_LEVEL: str = "INFO"
@@ -67,6 +68,15 @@ class Settings(BaseSettings):
     MEMORY_THRESHOLD_PERCENT: float = 80.0  # 메모리 임계값 (%)
     MAX_CONCURRENT_LOADS: int = 10  # 최대 동시 로드 개수
     CLEANUP_INTERVAL_SECONDS: int = 300  # 자동 정리 주기 (초, 5분)
+    
+    # 환경 변수 값 정제
+    @field_validator('EMBEDDING_MODEL', mode='before')
+    @classmethod
+    def clean_embedding_model(cls, v):
+        """환경 변수에서 주석 제거 (예: 'openai  # comment' -> 'openai')"""
+        if isinstance(v, str):
+            return v.split('#')[0].strip()
+        return v
     
     class Config:
         env_file = ".env"
@@ -164,4 +174,3 @@ class Settings(BaseSettings):
 
 # 전역 설정 인스턴스
 settings = Settings()
-

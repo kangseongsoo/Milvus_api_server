@@ -12,6 +12,13 @@ class ChunkData(BaseModel):
     text: str = Field(..., description="청크 텍스트", example="인공지능은 데이터를 기반으로...")
 
 
+class ChunkDataWithEmbedding(BaseModel):
+    """임베딩 벡터를 포함한 청크 데이터 (마이그레이션용)"""
+    chunk_index: int = Field(..., description="청크 순서 (0부터 시작)", example=0)
+    text: str = Field(..., description="청크 텍스트", example="인공지능은 데이터를 기반으로...")
+    embedding: List[float] = Field(..., description="임베딩 벡터 (기존 PostgreSQL에서 가져옴)", example=[0.1, 0.2, 0.3])
+
+
 class DocumentInsertRequest(BaseModel):
     """
     문서 삽입 요청 (최종 간소화 버전)
@@ -88,6 +95,23 @@ class BatchInsertRequest(BaseModel):
     """배치 문서 삽입 요청"""
     account_name: str = Field(..., description="계정명", example="chatty")
     documents: List[DocumentWithChunks] = Field(..., description="문서 리스트", min_items=1)
+
+
+class DocumentWithChunksAndEmbeddings(BaseModel):
+    """임베딩을 포함한 문서와 청크 묶음 (마이그레이션용)"""
+    # 필수 필드
+    chat_bot_id: str = Field(..., description="챗봇 ID (UUID)", example="550e8400-e29b-41d4-a716-446655440000")
+    content_name: str = Field(..., description="문서 고유 식별자 (파일명, URL, 제목 등)", example="https://example.com/article1")
+    chunks: List[ChunkDataWithEmbedding] = Field(..., description="임베딩 포함 텍스트 청크 리스트", min_items=1)
+    
+    # 선택 필드 (자유 형식 메타데이터)
+    metadata: Optional[Dict[str, Any]] = Field(default_factory=dict, description="문서 메타데이터 (자유 형식 JSON)")
+
+
+class BatchInsertWithEmbeddingsRequest(BaseModel):
+    """임베딩을 포함한 배치 문서 삽입 요청 (마이그레이션용)"""
+    account_name: str = Field(..., description="계정명", example="chatty")
+    documents: List[DocumentWithChunksAndEmbeddings] = Field(..., description="임베딩 포함 문서 리스트", min_items=1)
 
 
 class BatchInsertResult(BaseModel):
@@ -187,6 +211,12 @@ class DocumentDeleteResponse(BaseModel):
 
 
 
+
+
+class BotDeleteRequest(BaseModel):
+    """봇 전체 삭제 요청 (chat_bot_id 기준)"""
+    account_name: str = Field(..., description="계정명", example="chatty")
+    chat_bot_id: str = Field(..., description="챗봇 ID (UUID)", example="550e8400-e29b-41d4-a716-446655440000")
 
 
 class BotDeleteResponse(BaseModel):

@@ -102,6 +102,11 @@ class MilvusClient:
             # metadata는 인덱스 불필요 (expr로 직접 필터링)
             
             logger.info(f"✅ 통합 컬렉션 생성 완료: {collection_name}")
+            
+            # 컬렉션 로드 (즉시 사용 가능한 상태로)
+            collection.load()
+            logger.info(f"✅ 컬렉션 로드 완료: {collection_name} (즉시 검색 가능)")
+            
             return collection
             
         except Exception as e:
@@ -502,17 +507,37 @@ class MilvusClient:
                 logger.warning(f"파티션이 존재하지 않음: {partition_name}")
                 return 0
             
-            # 파티션 삭제 전 벡터 수 확인
-            collection.load(partition_names=[partition_name])
-            stats = collection.get_stats()
-            vector_count = stats.get('row_count', 0)
+            partition = collection.partition(partition_name)
             
-            # 파티션 삭제
+            # 1. 파티션 로드 상태 확인
+            from pymilvus import utility
+            try:
+                load_state = utility.load_state(collection_name, partition_name)
+                is_loaded = (load_state == utility.LoadState.Loaded)
+            except Exception:
+                # load_state 확인 실패 시 안전하게 언로드 시도
+                is_loaded = False
+            
+            # 2. 로드되어 있으면 언로드
+            if is_loaded:
+                try:
+                    partition.release()
+                    logger.info(f"파티션 언로드 완료: {partition_name}")
+                except Exception as release_error:
+                    logger.warning(f"파티션 언로드 시도 중 오류 (무시): {release_error}")
+            else:
+                # 이미 언로드되어 있으면 시도만 (안전장치)
+                try:
+                    partition.release()
+                except Exception:
+                    pass  # 이미 언로드되어 있으면 무시
+            
+            # 3. 파티션 삭제
             collection.drop_partition(partition_name)
             
-            logger.info(f"Milvus 파티션 삭제 완료: {partition_name}, 삭제된 벡터={vector_count}개")
+            logger.info(f"Milvus 파티션 삭제 완료: {partition_name}")
             
-            return vector_count
+            return 0  # 벡터 수 확인하지 않으므로 0 반환
             
         except Exception as e:
             logger.error(f"Milvus 파티션 삭제 실패: {str(e)}")

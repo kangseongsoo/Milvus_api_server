@@ -7,11 +7,13 @@ from app.models.document import (
     DocumentInsertResponse,
     BatchInsertRequest,
     BatchInsertResponse,
+    BatchInsertWithEmbeddingsRequest,
     DocumentResponse,
     DocumentUpdateRequest,
     DocumentUpdateResponse,
     DocumentDeleteRequest,
     DocumentDeleteResponse,
+    BotDeleteRequest,
     BotDeleteResponse,
     MetadataUpdateRequest,
     MetadataUpdateResponse
@@ -376,6 +378,174 @@ async def batch_insert_documents(request: BatchInsertRequest):
         )
 
 
+@router.post("/insert/batch/with-embeddings", response_model=BatchInsertResponse, status_code=status.HTTP_201_CREATED)
+async def batch_insert_documents_with_embeddings(request: BatchInsertWithEmbeddingsRequest):
+    """
+    임베딩을 포함한 여러 문서 일괄 삽입 (마이그레이션용)
+    
+    기존 PostgreSQL에 저장된 임베딩 벡터를 그대로 사용하여 Milvus에 삽입
+    - 임베딩 생성 단계를 스킵하고 제공된 벡터를 직접 사용
+    - PostgreSQL 트랜잭션으로 모든 문서+청크 원자성 보장
+    - Milvus 배치 벡터 저장 (재시도 로직 포함)
+    - 실패 시 보상 트랜잭션으로 PostgreSQL 롤백
+    """
+    doc_ids = []
+    try:
+        start_time = datetime.now()
+        total_docs = len(request.documents)
+        total_chunks = sum(len(doc.chunks) for doc in request.documents)
+        collection_name = f"collection_{request.account_name}"
+        
+        logger.info(f"📝 배치 삽입 시작 (임베딩 포함, 마이그레이션용)")
+        logger.info(f"   - Account: {request.account_name}")
+        logger.info(f"   - Documents: {total_docs}개")
+        logger.info(f"   - Total Chunks: {total_chunks}개")
+        logger.info(f"   - Collection: {collection_name}")
+        logger.info(f"   - 임베딩 생성: 스킵 (기존 벡터 사용)")
+        
+        # ========== Step 1: PostgreSQL 배치 트랜잭션 (원자성 보장) ==========
+        postgres_start = datetime.now()
+        
+        # 문서 데이터 준비 (메타데이터 분리)
+        documents_data = []
+        for doc in request.documents:
+            # 메타데이터 분리
+            all_metadata = doc.metadata or {}
+            
+            documents_data.append({
+                "document_data": {
+                    "chat_bot_id": doc.chat_bot_id,
+                    "content_name": doc.content_name,  # 문서 고유 식별자
+                    "metadata": all_metadata  # 전체 메타데이터를 PostgreSQL에 저장
+                },
+                "chunks": [{"chunk_index": c.chunk_index, "text": c.text} for c in doc.chunks]
+            })
+        
+        doc_ids = await postgres_client.batch_insert_documents_with_chunks_transaction(
+            account_name=request.account_name,
+            documents=documents_data
+        )
+        
+        postgres_time = (datetime.now() - postgres_start).total_seconds() * 1000
+        logger.info(f"✅ PostgreSQL 배치 트랜잭션 완료: {len(doc_ids)}개 문서")
+        
+        # ========== Step 2: 임베딩 생성 스킵 (이미 제공됨) ==========
+        embedding_start = datetime.now()
+        embedding_time = 0.0  # 임베딩 생성하지 않음
+        logger.info(f"⏭️ 임베딩 생성 스킵 (기존 벡터 사용): {total_chunks}개 벡터")
+        
+        # ========== Step 3: Milvus 배치 벡터 저장 (재시도 로직) ==========
+        milvus_start = datetime.now()
+        
+        try:
+            # 문서별 데이터 준비
+            documents_data = []
+            
+            for i, doc in enumerate(request.documents):
+                doc_id = doc_ids[i]
+                
+                # 메타데이터 분리
+                all_metadata = doc.metadata or {}
+                milvus_metadata = filter_milvus_metadata(all_metadata)  # Milvus 필터링용
+                
+                # 청크에 이미 임베딩이 포함되어 있음
+                chunks_with_embeddings = []
+                for chunk in doc.chunks:
+                    chunks_with_embeddings.append({
+                        "chunk_index": chunk.chunk_index,
+                        "embedding": chunk.embedding,  # 제공된 임베딩 사용
+                        "text": chunk.text
+                    })
+                
+                documents_data.append({
+                    "chat_bot_id": doc.chat_bot_id,
+                    "doc_id": doc_id,
+                    "content_name": doc.content_name,  # content_name 추가
+                    "chunks": chunks_with_embeddings,
+                    "metadata": milvus_metadata  # 필터링용 메타데이터만 Milvus에
+                })
+            
+            # Milvus 배치 삽입
+            await milvus_client.batch_insert_vectors_with_retry(
+                account_name=request.account_name,
+                documents_data=documents_data,
+                metadata={},  # 개별 문서 메타데이터가 우선됨
+                max_retries=3,
+                backoff=2.0
+            )
+            
+            milvus_time = (datetime.now() - milvus_start).total_seconds() * 1000
+            logger.info(f"✅ Milvus 배치 벡터 삽입 완료")
+            
+        except Exception as milvus_error:
+            # Milvus 실패 시 PostgreSQL 롤백 (보상 트랜잭션)
+            logger.error(f"❌ Milvus 배치 삽입 실패, PostgreSQL 롤백 시작: {str(milvus_error)}")
+            for doc_id in doc_ids:
+                try:
+                    await postgres_client.delete_document(request.account_name, request.documents[0].chat_bot_id, doc_id)
+                except:
+                    pass  # 롤백 실패는 로그만 남기고 계속
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail=f"Milvus 배치 삽입 실패: {str(milvus_error)}"
+            )
+        
+        # ========== Step 4: 🔥 자동 flush 마킹 (이벤트 기반) ==========
+        await auto_flusher.mark_for_flush(collection_name)
+        logger.info(f"🔥 Flush marked: {collection_name}")
+        
+        total_time = (datetime.now() - start_time).total_seconds() * 1000
+        
+        # 성공 결과 생성
+        results = []
+        for i, doc in enumerate(request.documents):
+            results.append({
+                "doc_id": doc_ids[i],
+                "title": doc.metadata.get('title', '(제목 없음)') if doc.metadata else '(제목 없음)',
+                "total_chunks": len(doc.chunks),
+                "success": True
+            })
+        
+        logger.info(f"✅ 배치 삽입 완료 (임베딩 포함, 마이그레이션)")
+        logger.info(f"   - 성공: {len(doc_ids)}개 문서")
+        logger.info(f"   - 총 소요 시간: {total_time:.2f}ms")
+        logger.info(f"   - 임베딩 생성 시간: 0ms (스킵됨)")
+        logger.info(f"   - 검색 가능 시간: 0.5초 이내")
+        
+        from app.models.document import BatchInsertResult
+        return BatchInsertResponse(
+            status="success",
+            total_documents=total_docs,
+            total_chunks=total_chunks,
+            success_count=len(doc_ids),
+            failure_count=0,
+            results=[BatchInsertResult(**r) for r in results],
+            postgres_insert_time_ms=postgres_time,
+            embedding_time_ms=embedding_time,  # 0ms
+            milvus_insert_time_ms=milvus_time,
+            total_time_ms=total_time
+        )
+        
+    except HTTPException:
+        # HTTPException은 그대로 재발생
+        raise
+    except Exception as e:
+        # 예상치 못한 오류 시 PostgreSQL 롤백
+        if doc_ids:
+            logger.error(f"❌ 예상치 못한 오류 발생, PostgreSQL 롤백 시작: {str(e)}")
+            for doc_id in doc_ids:
+                try:
+                    await postgres_client.delete_document(request.account_name, request.documents[0].chat_bot_id, doc_id)
+                except Exception as rollback_error:
+                    logger.error(f"❌ PostgreSQL 롤백 실패 (doc_id: {doc_id}): {str(rollback_error)}")
+        
+        logger.error(f"❌ 배치 삽입 실패 (임베딩 포함): {str(e)}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Batch insert with embeddings failed: {str(e)}"
+        )
+
+
 @router.get("/document/{doc_id}", response_model=DocumentResponse)
 async def get_document(
     doc_id: int,
@@ -618,11 +788,8 @@ async def delete_document(request: DocumentDeleteRequest):
         )
 
 
-@router.delete("/bot/{chat_bot_id}", response_model=BotDeleteResponse)
-async def delete_bot_data(
-    chat_bot_id: str,
-    account_name: str = Query(..., description="계정명")
-):
+@router.post("/bot/delete", response_model=BotDeleteResponse, status_code=status.HTTP_200_OK)
+async def delete_bot_data(request: BotDeleteRequest):
     """
     봇 전체 데이터 삭제 (chat_bot_id 기준) - Saga Pattern 적용
     
@@ -630,16 +797,22 @@ async def delete_bot_data(
     - Milvus: 해당 파티션의 모든 벡터 삭제 (먼저)
     - PostgreSQL: 해당 봇의 모든 문서와 청크 삭제 (나중에)
     - PostgreSQL 실패 시 Milvus 복구 (보상 트랜잭션)
+    - 자동 flush로 실시간 반영
+    
+    Saga Pattern 장점:
+    - 데이터 일관성 보장
+    - 부분 실패 시 자동 복구
+    - POST 메서드로 요청 본문에 안전하게 데이터 전달
     """
     try:
         start_time = datetime.now()
         
         logger.info(f"🗑️ 봇 전체 삭제 시작 (Saga Pattern)")
-        logger.info(f"   - Account: {account_name}")
-        logger.info(f"   - Bot ID: {chat_bot_id}")
+        logger.info(f"   - Account: {request.account_name}")
+        logger.info(f"   - Bot ID: {request.chat_bot_id}")
         
-        collection_name = f"collection_{account_name}"
-        partition_name = generate_partition_name(chat_bot_id)
+        collection_name = f"collection_{request.account_name}"
+        partition_name = generate_partition_name(request.chat_bot_id)
         
         # ========== Step 1: Milvus에서 파티션 삭제 (먼저) ==========
         milvus_start = datetime.now()
@@ -663,7 +836,7 @@ async def delete_bot_data(
         postgres_start = datetime.now()
         
         try:
-            deleted_docs, deleted_chunks = await postgres_client.delete_bot_data(account_name, chat_bot_id)
+            deleted_docs, deleted_chunks = await postgres_client.delete_bot_data(request.account_name, request.chat_bot_id)
             postgres_time = (datetime.now() - postgres_start).total_seconds() * 1000
             logger.info(f"✅ PostgreSQL 봇 삭제 완료: {deleted_docs}개 문서, {deleted_chunks}개 청크, {postgres_time:.2f}ms")
             
@@ -682,19 +855,24 @@ async def delete_bot_data(
                 detail=f"PostgreSQL bot deletion failed: {str(postgres_error)}"
             )
         
-        # ========== Step 3: 결과 반환 ==========
+        # ========== Step 3: 🔥 자동 flush 마킹 (삭제 이벤트) ==========
+        await auto_flusher.mark_for_flush(collection_name)
+        logger.info(f"🔥 Flush marked after bot delete: {collection_name}")
+        
+        # ========== Step 4: 결과 반환 ==========
         total_time = (datetime.now() - start_time).total_seconds() * 1000
         
         logger.info(f"✅ 봇 전체 삭제 완료 (Saga Pattern 성공)")
-        logger.info(f"   - Bot ID: {chat_bot_id}")
+        logger.info(f"   - Bot ID: {request.chat_bot_id}")
         logger.info(f"   - 삭제된 문서: {deleted_docs}개")
         logger.info(f"   - 삭제된 청크: {deleted_chunks}개")
         logger.info(f"   - 삭제된 벡터: {deleted_vectors}개")
         logger.info(f"   - 총 소요 시간: {total_time:.2f}ms")
+        logger.info(f"   - 검색에서 제외: 0.5초 이내")
         
         return BotDeleteResponse(
             status="success",
-            chat_bot_id=chat_bot_id,
+            chat_bot_id=request.chat_bot_id,
             deleted_documents=deleted_docs,
             deleted_chunks=deleted_chunks,
             deleted_vectors=deleted_vectors,

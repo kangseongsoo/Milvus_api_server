@@ -824,7 +824,16 @@ class PostgresClient:
         Returns:
             존재하는 content_name 리스트
         """
+        from app.utils.logger import setup_logger
+        logger = setup_logger(__name__)
+        
         pool = await self.get_pool(account_name)
+        
+        logger.info(f"🔍 PostgreSQL에서 content_name 존재 확인 시작")
+        logger.info(f"   - Account: {account_name}")
+        logger.info(f"   - Bot ID: {chat_bot_id}")
+        logger.info(f"   - 요청한 content_names: {len(content_names)}개")
+        logger.info(f"   - 요청한 content_names 값: {content_names}")
         
         async with pool.acquire() as conn:
             if len(content_names) == 1:
@@ -833,8 +842,39 @@ class PostgresClient:
                 SELECT content_name FROM documents 
                 WHERE chat_bot_id = $1 AND content_name = $2
                 """
+                logger.debug(f"SQL 쿼리: {query}, chat_bot_id={chat_bot_id}, content_name={content_names[0]}")
                 result = await conn.fetchrow(query, chat_bot_id, content_names[0])
-                return [content_names[0]] if result else []
+                
+                if result:
+                    logger.info(f"✅ 문서 발견: content_name='{result['content_name']}'")
+                    return [content_names[0]]
+                else:
+                    logger.warning(f"❌ 문서를 찾지 못함: content_name='{content_names[0]}'")
+                    
+                    # URL 형식인 경우에만 http/https 차이 자동 매칭 시도
+                    requested_name = content_names[0]
+                    if requested_name.startswith('http://') or requested_name.startswith('https://'):
+                        # http ↔ https 교체
+                        if requested_name.startswith('http://'):
+                            alternative_name = requested_name.replace('http://', 'https://', 1)
+                        else:
+                            alternative_name = requested_name.replace('https://', 'http://', 1)
+                        
+                        logger.info(f"🔄 URL 형식 감지, http/https 차이로 재검색: '{alternative_name}'")
+                        alt_query = """
+                        SELECT content_name FROM documents 
+                        WHERE chat_bot_id = $1 AND content_name = $2
+                        """
+                        alt_result = await conn.fetchrow(alt_query, chat_bot_id, alternative_name)
+                        
+                        if alt_result:
+                            matched_name = alt_result['content_name']
+                            logger.info(f"✅ 자동 매칭 (http/https): '{requested_name}' → '{matched_name}'")
+                            return [matched_name]
+                        else:
+                            logger.warning(f"❌ http/https 교체 버전도 찾지 못함: '{alternative_name}'")
+                
+                return []
             else:
                 # 여러 문서인 경우
                 placeholders = ','.join([f'${i+2}' for i in range(len(content_names))])
@@ -842,8 +882,46 @@ class PostgresClient:
                 SELECT content_name FROM documents 
                 WHERE chat_bot_id = $1 AND content_name IN ({placeholders})
                 """
+                logger.debug(f"SQL 쿼리: {query}, chat_bot_id={chat_bot_id}, content_names={content_names}")
                 results = await conn.fetch(query, chat_bot_id, *content_names)
-                return [row['content_name'] for row in results]
+                found_names = [row['content_name'] for row in results]
+                
+                logger.info(f"✅ 발견된 문서: {len(found_names)}개 / {len(content_names)}개")
+                
+                # 찾지 못한 content_names에 대해 URL 형식인 경우 http/https 차이만 자동 매칭
+                missing = set(content_names) - set(found_names)
+                if missing:
+                    logger.warning(f"❌ 찾지 못한 content_names: {missing}")
+                    
+                    # 각 누락된 content_name에 대해 URL 형식인 경우만 http/https 매칭
+                    for missing_name in missing:
+                        # URL 형식인 경우에만 http/https 차이 자동 매칭 시도
+                        if missing_name.startswith('http://') or missing_name.startswith('https://'):
+                            # http ↔ https 교체
+                            if missing_name.startswith('http://'):
+                                alternative_name = missing_name.replace('http://', 'https://', 1)
+                            else:
+                                alternative_name = missing_name.replace('https://', 'http://', 1)
+                            
+                            logger.info(f"🔄 URL 형식 감지, http/https 차이로 재검색: '{alternative_name}'")
+                            alt_query = """
+                            SELECT content_name FROM documents 
+                            WHERE chat_bot_id = $1 AND content_name = $2
+                            """
+                            alt_result = await conn.fetchrow(alt_query, chat_bot_id, alternative_name)
+                            
+                            if alt_result:
+                                matched_name = alt_result['content_name']
+                                # 이미 찾은 목록에 없는 경우만 추가
+                                if matched_name not in found_names:
+                                    logger.info(f"✅ 자동 매칭 (http/https): '{missing_name}' → '{matched_name}'")
+                                    found_names.append(matched_name)
+                                else:
+                                    logger.warning(f"⚠️ 매칭된 content_name '{matched_name}'는 이미 다른 요청과 매칭됨")
+                            else:
+                                logger.warning(f"❌ http/https 교체 버전도 찾지 못함: '{alternative_name}'")
+                
+                return found_names
 
     async def delete_bot_data(self, account_name: str, chat_bot_id: str) -> tuple:
         """

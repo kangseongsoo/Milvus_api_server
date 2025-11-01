@@ -43,7 +43,7 @@ class AutoFlusher:
         async with self._flush_lock:
             self.collections_to_flush.add(collection_name)
             self.last_change_time[collection_name] = datetime.now()
-            logger.debug(f"📌 Marked for flush: {collection_name}")
+            logger.info(f"📌 Marked for flush: {collection_name}")
     
     async def start(self):
         """
@@ -113,16 +113,17 @@ class AutoFlusher:
             try:
                 start_time = datetime.now()
                 
+                logger.info(f"🔥 Auto-Flushing: {coll_name}...")
+                
                 collection = Collection(name=coll_name)
                 collection.flush()
                 
                 elapsed = (datetime.now() - start_time).total_seconds()
+                logger.info(f"✅ Flush 완료: {coll_name} ({elapsed:.2f}초)")
                 self.last_flush_time[coll_name] = datetime.now()
                 
                 # 마킹 제거
                 self.collections_to_flush.discard(coll_name)
-                
-                logger.info(f"✅ Flushed {coll_name} in {elapsed:.3f}s (event-driven)")
                 
             except Exception as e:
                 logger.error(f"❌ Failed to flush {coll_name}: {e}")
