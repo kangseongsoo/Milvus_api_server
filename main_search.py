@@ -1,18 +1,16 @@
 """
-FastAPI 애플리케이션 진입점
-통합 서버 (삽입 + 검색)
-혹시 몰라 남겨놓지만 사용하지 않음
-main_insert.py와 main_search.py를 사용하세요
+FastAPI 검색 서버 (Search API Server)
+- 벡터 유사도 검색 API
+- 읽기 전용 (읽기 최적화)
 """
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from contextlib import asynccontextmanager
 from app.config import settings
-from app.api import collection, data, search
+from app.api import search
 from fastapi import APIRouter
 from app.utils.logger import setup_logger
 from app.core.partition_manager import partition_manager
-from app.core.auto_flusher import auto_flusher
 import asyncio
 
 # 로거 설정
@@ -24,29 +22,27 @@ async def lifespan(app: FastAPI):
     """FastAPI 생명주기 관리"""
     
     # ========== 시작 시 실행 ==========
-    logger.info("🚀 FastAPI Application Starting...")
+    logger.info("🚀 FastAPI Search Server Starting...")
     
     try:
-        # Milvus 연결
+        # Milvus 연결 (milvus_client.py가 "default" alias 사용)
         from pymilvus import connections
         connections.connect(
-            alias="default",
+            alias="default",  # milvus_client.py와 일치해야 함
             host=settings.MILVUS_HOST,
             port=settings.MILVUS_PORT
         )
         logger.info(f"✅ Connected to Milvus ({settings.MILVUS_HOST}:{settings.MILVUS_PORT})")
         
-        # PostgreSQL 연결 테스트
+        # PostgreSQL 연결 테스트 (검색 시 메타데이터 조회용)
         logger.info(f"✅ PostgreSQL Connected to ({settings.POSTGRES_HOST}:{settings.POSTGRES_PORT})")
         
-        # 파티션 매니저 초기화 (Redis 없이 Milvus 상태 직접 확인)
-        logger.info("✅ Partition manager initialized (Milvus state-based)")
+        # 모든 컬렉션 전체 로드 (시작 시 한 번만)
+        logger.info("🔄 Loading all collections...")
+        preload_result = await partition_manager.preload_all_collections()
+        logger.info(f"✅ All collections loaded: {preload_result['collections_loaded']} collections, {preload_result['total_partitions']} partitions")
         
-        # 자동 flush 백그라운드 태스크 시작
-        flush_task = asyncio.create_task(auto_flusher.start())
-        logger.info(f"✅ Auto-flusher started (delay: {auto_flusher.delay_seconds}s, max_wait: {auto_flusher.max_wait_seconds}s)")
-        
-        logger.info("🎉 FastAPI Application Ready!")
+        logger.info("🎉 FastAPI Search Server Ready!")
         
     except Exception as e:
         logger.error(f"❌ Failed to initialize application: {e}")
@@ -55,21 +51,11 @@ async def lifespan(app: FastAPI):
     yield
     
     # ========== 종료 시 실행 ==========
-    logger.info("🛑 FastAPI Application Shutting Down...")
+    logger.info("🛑 FastAPI Search Server Shutting Down...")
     
     try:
         # 파티션 매니저 정리 (Redis 없이 동작하므로 별도 종료 불필요)
         logger.info("✅ Partition manager cleanup completed")
-        
-        # 자동 flush 중지
-        await auto_flusher.stop()
-        if 'flush_task' in locals():
-            flush_task.cancel()
-            try:
-                await asyncio.wait_for(flush_task, timeout=2.0)
-            except (asyncio.CancelledError, asyncio.TimeoutError):
-                pass
-        logger.info("✅ Auto-flusher stopped")
         
         # 약간의 대기 (백그라운드 태스크 정리 완료 대기)
         await asyncio.sleep(0.1)
@@ -87,13 +73,13 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logger.error(f"❌ Error during shutdown: {e}")
     
-    logger.info("👋 FastAPI Application Stopped")
+    logger.info("👋 FastAPI Search Server Stopped")
 
 
 # FastAPI 앱 생성
 app = FastAPI(
-    title="Milvus RAG API Server",
-    description="RAG 시스템을 위한 Milvus + PostgreSQL 하이브리드 백엔드",
+    title="Milvus RAG API Server - Search",
+    description="RAG 시스템을 위한 Milvus 벡터 검색 서버 (Vector Similarity Search)",
     version="0.1.0",
     docs_url="/docs",
     redoc_url="/redoc",
@@ -109,9 +95,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# 라우터 등록
-app.include_router(collection.router, prefix="/collection", tags=["Collection"])
-app.include_router(data.router, prefix="/data", tags=["Data"])
+# 검색 서버 라우터 등록
 app.include_router(search.router, prefix="/search", tags=["Search"])
 
 # 디버깅용 라우터
@@ -137,56 +121,7 @@ async def get_partition_status():
         "loaded_partitions": all_partitions
     }
 
-@debug_router.post("/partitions/cleanup")
-async def trigger_cleanup():
-    """수동으로 정리 실행 (디버깅용)"""
-    # Redis 없이 동작하므로 cleanup 불필요
-    return {"message": "Cleanup not needed (Redis removed)"}
-
-@debug_router.get("/count/{collection_name}")
-async def count_entities(collection_name: str):
-    """컬렉션 및 파티션별 벡터 개수 확인 (디버깅용)"""
-    from pymilvus import Collection
-    try:
-        collection = Collection(name=collection_name)
-        collection.flush()  # 최신 데이터 반영
-        
-        # 전체 개수
-        total = collection.num_entities
-        
-        # 파티션별 개수
-        partition_counts = {}
-        for partition in collection.partitions:
-            try:
-                count = partition.num_entities
-                partition_counts[partition.name] = count
-            except Exception as e:
-                partition_counts[partition.name] = f"Error: {str(e)}"
-        
-        return {
-            "collection": collection_name,
-            "total_entities": total,
-            "partitions": partition_counts,
-            "status": "success"
-        }
-    except Exception as e:
-        return {"message": str(e), "status": "error"}
-
-@debug_router.post("/flush/{collection_name}")
-async def manual_flush(collection_name: str):
-    """수동 flush 실행 (디버깅용)"""
-    from pymilvus import Collection
-    try:
-        collection = Collection(name=collection_name)
-        collection.load()  # 컬렉션 로드
-        collection.flush()  # Flush
-        return {"message": f"Flushed {collection_name}", "status": "success"}
-    except Exception as e:
-        return {"message": str(e), "status": "error"}
-
 app.include_router(debug_router, prefix="/debug", tags=["Debug"])
-
-
 
 
 @app.get("/")
@@ -194,7 +129,7 @@ async def root():
     """헬스 체크"""
     return {
         "status": "healthy",
-        "service": "Milvus RAG API Server",
+        "service": "Milvus RAG API Server - Search",
         "version": "0.1.0"
     }
 
@@ -211,6 +146,7 @@ async def health_check():
     
     return {
         "status": "healthy",
+        "service": "search",
         "milvus": {
             "host": settings.MILVUS_HOST,
             "port": settings.MILVUS_PORT
@@ -225,4 +161,3 @@ async def health_check():
         },
         "partitions": partition_stats
     }
-

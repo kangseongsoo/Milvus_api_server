@@ -164,9 +164,18 @@ class MilvusClient:
         
         Note:
             collection_{account_name}의 특정 파티션에 삽입
+            삽입 전에 파티션이 로드되어 있는지 확인하고 필요 시 로드합니다.
         """
         try:
             collection_name = settings.get_collection_name(account_name)
+            
+            # 파티션 생성 확인 (컬렉션은 이미 전체 로드되어 있음)
+            from app.core.partition_manager import partition_manager
+            await partition_manager.ensure_partition_loaded(
+                collection_name=collection_name,
+                partition_name=partition_name
+            )
+            
             collection = Collection(name=collection_name)
             
             # 메타데이터 기본값
@@ -273,10 +282,17 @@ class MilvusClient:
         
         Returns:
             각 문서별 삽입된 벡터 ID 리스트
+        
+        Note:
+            삽입 전에 필요한 파티션들이 로드되어 있는지 확인하고 필요 시 로드합니다.
         """
         try:
             collection_name = settings.get_collection_name(account_name)
             collection = Collection(name=collection_name)
+            
+            # 파티션 생성 확인 (컬렉션은 이미 전체 로드되어 있음)
+            from app.core.partition_manager import partition_manager
+            processed_partitions = set()
             
             all_vector_ids = []
             
@@ -285,6 +301,14 @@ class MilvusClient:
                 doc_id = doc_data["doc_id"]
                 chunks = doc_data["chunks"]
                 partition_name = f"bot_{chat_bot_id.replace('-', '')}"
+                
+                # 파티션 생성 확인 (한 번만 처리)
+                if partition_name not in processed_partitions:
+                    await partition_manager.ensure_partition_loaded(
+                        collection_name=collection_name,
+                        partition_name=partition_name
+                    )
+                    processed_partitions.add(partition_name)
                 
                 # 개별 문서 메타데이터 사용 (우선순위: 개별 > 공통)
                 doc_metadata = doc_data.get("metadata", {}) or metadata or {}
@@ -509,13 +533,14 @@ class MilvusClient:
             
             partition = collection.partition(partition_name)
             
-            # 1. 파티션 로드 상태 확인
+            # 1. 파티션 로드 상태 확인 (이미 존재 확인했으므로 바로 확인)
             from pymilvus import utility
             try:
                 load_state = utility.load_state(collection_name, partition_name)
                 is_loaded = (load_state == utility.LoadState.Loaded)
-            except Exception:
+            except Exception as e:
                 # load_state 확인 실패 시 안전하게 언로드 시도
+                logger.debug(f"파티션 로드 상태 확인 실패: {partition_name} - {e}")
                 is_loaded = False
             
             # 2. 로드되어 있으면 언로드

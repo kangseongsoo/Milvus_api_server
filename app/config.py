@@ -32,13 +32,6 @@ class Settings(BaseSettings):
     # DB 네이밍 (계정별 데이터베이스)
     POSTGRES_DB_PREFIX: str = "rag_db_"  # 예: rag_db_chatty, rag_db_enterprise
     
-    # Redis 설정
-    REDIS_HOST: str = "localhost"
-    REDIS_PORT: int = 6379
-    REDIS_PASSWORD: Optional[str] = None
-    REDIS_DB: int = 0
-    REDIS_MAX_CONNECTIONS: int = 10
-    
     # 봇별 테이블 네이밍
     # bot_id (UUID)를 테이블명으로 변환: bot_{uuid_without_hyphens}
     BOT_TABLE_PREFIX: str = "bot_"  # 예: bot_550e8400e29b41d4a716446655440000
@@ -59,7 +52,7 @@ class Settings(BaseSettings):
     
     # Milvus 메타데이터 필터링 필드 설정
     MILVUS_METADATA_FIELDS: list = [
-        "content_type", "source_type", "language", "tags", "category", "source_url",
+        "content_type", "source_type", "language", "tags", "category", "source_url","created_at","updated_at"
     ]
     CONNECTION_POOL_SIZE: int = 10  # PostgreSQL 연결 풀 크기
     

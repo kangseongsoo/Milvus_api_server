@@ -4,7 +4,7 @@
 from fastapi import APIRouter, HTTPException, status
 from app.models.search import SearchRequest, SearchResponse
 from app.utils.logger import setup_logger
-from app.core.redis_partition_manager import redis_partition_manager
+from app.core.partition_manager import partition_manager
 from app.core.embedding import embedding_service
 from app.core.milvus_client import milvus_client
 from app.core.postgres_client import postgres_client
@@ -37,40 +37,12 @@ async def search_documents(request: SearchRequest):
         
         logger.info(f"검색 요청 (account: {request.account_name}, bot: {request.chat_bot_id}): '{request.query_text}', limit={request.limit}")
         
-        # ========== Step 0: 파티션 로드 (검색 필수!) ==========
-        partition_load_start = datetime.now()
-        logger.info(f"파티션 로드 확인: {partition_name}")
-        
-        # 검색 시 컬렉션 로드 상태 확인하여 적절히 로드
-        from pymilvus import utility, Collection
-        collection_obj = Collection(name=collection_name)
-        
-        try:
-            collection_load_state = utility.load_state(collection_name)
-            collection_is_loaded = (collection_load_state == utility.LoadState.Loaded)
-        except Exception:
-            collection_is_loaded = False
-        
-        if collection_is_loaded:
-            # 컬렉션이 이미 로드되어 있으면 기존 방식대로 파티션만 로드
-            await redis_partition_manager.ensure_partition_loaded(
-                collection_name=collection_name,
-                partition_name=partition_name
-            )
-        else:
-            # 컬렉션이 언로드되어 있으면 컬렉션을 로드하면서 특정 파티션만 선택적으로 로드
-            logger.info(f"Collection {collection_name} is not loaded, loading collection with partition: {partition_name}")
-            collection_obj.load(partition_names=[partition_name])
-            logger.info(f"✅ Collection {collection_name} loaded with partition {partition_name}")
-            
-            # Redis에 상태 저장 및 접근 시간 업데이트
-            from app.core.redis_client import redis_client
-            partition_state_manager = redis_partition_manager._partition_state_manager
-            await partition_state_manager.set_partition_loaded(collection_name, partition_name)
-            await partition_state_manager.update_access_time(collection_name, partition_name)
-        
-        partition_load_time = (datetime.now() - partition_load_start).total_seconds() * 1000
-        logger.info(f"✅ 파티션 로드 완료: {partition_load_time:.2f}ms (검색 가능)")
+        # ========== Step 0: 파티션 접근 시간 업데이트 ==========
+        # 컬렉션은 시작 시 전체 로드되어 있으므로 로드 체크 불필요
+        await partition_manager.ensure_partition_loaded(
+            collection_name=collection_name,
+            partition_name=partition_name
+        )
         
         # ========== Step 0.5: 쿼리 검증 ==========
         # 빈 문자열 또는 공백만 있는 경우 에러
@@ -101,31 +73,44 @@ async def search_documents(request: SearchRequest):
         try:
             collection = Collection(name=collection_name)
             
+            # ⚠️ ef=64 고정이므로 limit이 64보다 크면 64로 제한
+            EF_VALUE = 128
+            effective_limit = min(request.limit, EF_VALUE)
+            if request.limit > EF_VALUE:
+                logger.warning(f"⚠️ Requested limit ({request.limit}) exceeds ef ({EF_VALUE}), limiting to {EF_VALUE}")
+            
             # 검색 파라미터
             search_params = {
                 "metric_type": "COSINE",
-                "params": {"ef": 64}
+                "params": {"ef": EF_VALUE}
             }
             
             # 필터 표현식 구성
-            base_expr = f'chat_bot_id == "{request.chat_bot_id}"'
-            if request.filter_expr:
-                expr = f"{base_expr} and {request.filter_expr}"
-            else:
-                expr = base_expr
+            # ⚠️ partition_names로 이미 해당 파티션만 검색하므로 chat_bot_id 필터는 불필요
+            # 사용자 정의 필터만 expr로 전달
+            expr = request.filter_expr if request.filter_expr else None
             
-            logger.info(f"Milvus 검색 시작: expr='{expr}'")
+            if expr:
+                logger.info(f"Milvus 검색 시작: partition={partition_name}, expr='{expr}', limit={effective_limit}")
+            else:
+                logger.info(f"Milvus 검색 시작: partition={partition_name} (no filter), limit={effective_limit}")
             
             # 벡터 검색 실행
-            search_results = collection.search(
-                data=[query_vector],
-                anns_field="embedding_dense",
-                param=search_params,
-                limit=request.limit,
-                partition_names=[partition_name],
-                expr=expr,
-                output_fields=["doc_id", "chunk_index"]  # metadata 제거
-            )
+            # partition_names로 파티션 지정 (10~100배 빠름!)
+            search_kwargs = {
+                "data": [query_vector],
+                "anns_field": "embedding_dense",
+                "param": search_params,
+                "limit": effective_limit,  # ⭐ 제한된 limit 사용
+                "partition_names": [partition_name],  # ⭐ 파티션 지정으로 이미 chat_bot_id 필터링됨
+                "output_fields": ["doc_id", "chunk_index"]  # metadata 제거
+            }
+            
+            # expr은 사용자 정의 필터가 있을 때만 추가
+            if expr:
+                search_kwargs["expr"] = expr
+            
+            search_results = collection.search(**search_kwargs)
             
             search_time = (datetime.now() - search_start).total_seconds() * 1000
             logger.info(f"Milvus 검색 완료: {search_time:.2f}ms")
@@ -133,10 +118,10 @@ async def search_documents(request: SearchRequest):
             # 검색 결과 처리
             if not search_results or not search_results[0]:
                 logger.info("검색 결과 없음")
-                total_time = (datetime.now() - partition_load_start).total_seconds() * 1000
+                total_time = (datetime.now() - embedding_start).total_seconds() * 1000
                 return SearchResponse(
                     status="success",
-                    partition_load_time_ms=partition_load_time,
+                    partition_load_time_ms=0.0,  # 컬렉션은 이미 로드되어 있음
                     vector_search_time_ms=search_time + embedding_time,
                     postgres_query_time_ms=0.0,
                     total_time_ms=total_time,
@@ -252,15 +237,15 @@ async def search_documents(request: SearchRequest):
                 logger.warning(f"⚠️ 검색 결과에서 {skipped_count}개 문서 제외됨 (PostgreSQL에 존재하지 않음 - Milvus와 데이터 불일치)")
             
             # 시간 계산
-            total_time = (datetime.now() - partition_load_start).total_seconds() * 1000
+            total_time = (datetime.now() - embedding_start).total_seconds() * 1000
             vector_search_time = search_time + embedding_time
             
             logger.info(f"검색 완료: {len(results)}개 결과 반환 (Milvus에서 {len(hits)}개 발견, PostgreSQL에서 {len(documents)}개 존재, {skipped_count}개 제외)")
-            logger.info(f"⏱️  시간 측정 - 파티션 로드: {partition_load_time:.2f}ms, 벡터 검색: {vector_search_time:.2f}ms, PostgreSQL: {postgres_time:.2f}ms, 총: {total_time:.2f}ms")
+            logger.info(f"⏱️  시간 측정 - 벡터 검색: {vector_search_time:.2f}ms, PostgreSQL: {postgres_time:.2f}ms, 총: {total_time:.2f}ms")
             
             return SearchResponse(
                 status="success",
-                partition_load_time_ms=partition_load_time,
+                partition_load_time_ms=0.0,  # 컬렉션은 이미 로드되어 있음
                 vector_search_time_ms=vector_search_time,
                 postgres_query_time_ms=postgres_time,
                 total_time_ms=total_time,

@@ -10,6 +10,7 @@ class ChunkData(BaseModel):
     """청크 데이터 (간소화)"""
     chunk_index: int = Field(..., description="청크 순서 (0부터 시작)", example=0)
     text: str = Field(..., description="청크 텍스트", example="인공지능은 데이터를 기반으로...")
+    content_hash: Optional[str] = Field(None, description="청크 내용 해시 (선택사항)", example="a1b2c3d4e5f6...")
 
 
 class ChunkDataWithEmbedding(BaseModel):
@@ -17,6 +18,7 @@ class ChunkDataWithEmbedding(BaseModel):
     chunk_index: int = Field(..., description="청크 순서 (0부터 시작)", example=0)
     text: str = Field(..., description="청크 텍스트", example="인공지능은 데이터를 기반으로...")
     embedding: List[float] = Field(..., description="임베딩 벡터 (기존 PostgreSQL에서 가져옴)", example=[0.1, 0.2, 0.3])
+    content_hash: Optional[str] = Field(None, description="청크 내용 해시 (선택사항)", example="a1b2c3d4e5f6...")
 
 
 class DocumentInsertRequest(BaseModel):
@@ -72,8 +74,10 @@ class DocumentInsertRequest(BaseModel):
 class DocumentInsertResponse(BaseModel):
     """문서 삽입 응답"""
     status: str = Field(..., description="상태", example="success")
-    doc_id: int = Field(..., description="생성된 문서 ID", example=1234)
+    doc_id: Optional[int] = Field(None, description="생성된 문서 ID (중복 시 None)", example=1234)
     total_chunks: int = Field(..., description="삽입된 총 청크 수", example=120)
+    skipped: bool = Field(False, description="중복으로 스킵된 문서 여부", example=False)
+    error_message: Optional[str] = Field(None, description="에러 메시지 (실패 시)", example=None)
     postgres_insert_time_ms: float = Field(..., description="PostgreSQL 삽입 시간 (ms)", example=5.2)
     embedding_time_ms: float = Field(..., description="임베딩 처리 시간 (ms)", example=2450.8)
     milvus_insert_time_ms: float = Field(..., description="Milvus 삽입 시간 (ms)", example=180.5)
@@ -130,6 +134,9 @@ class BatchInsertResponse(BaseModel):
     total_chunks: int = Field(..., description="삽입된 총 청크 수", example=12000)
     success_count: int = Field(..., description="성공한 문서 수", example=98)
     failure_count: int = Field(..., description="실패한 문서 수", example=2)
+    inserted_documents: Optional[int] = Field(None, description="삽입된 문서 수 (success_count와 동일)", example=98)
+    total_vectors: Optional[int] = Field(None, description="삽입된 총 벡터 수 (total_chunks와 동일)", example=12000)
+    failed_content_names: List[str] = Field(default_factory=list, description="실패한 문서 content_name 리스트", example=[])
     results: List[BatchInsertResult] = Field(..., description="개별 결과 리스트")
     postgres_insert_time_ms: float = Field(..., description="PostgreSQL 삽입 시간 (ms)")
     embedding_time_ms: float = Field(..., description="임베딩 처리 시간 (ms)")
@@ -187,7 +194,7 @@ class MetadataUpdateResponse(BaseModel):
 
 class DocumentDeleteRequest(BaseModel):
     """문서 삭제 요청 (여러 문서 일괄 삭제)"""
-    content_names: List[str] = Field(..., description="삭제할 문서들의 고유 식별자 리스트", example=["test_document_001", "test_document_002"])
+    content_name: List[str] = Field(..., description="삭제할 문서들의 고유 식별자 리스트", example=["test_document_001", "test_document_002"])
     account_name: str = Field(..., description="계정명", example="chatty")
     chat_bot_id: str = Field(..., description="챗봇 ID (UUID)", example="550e8400-e29b-41d4-a716-446655440000")
 
@@ -230,3 +237,19 @@ class BotDeleteResponse(BaseModel):
     milvus_delete_time_ms: float = Field(..., description="Milvus 삭제 시간 (ms)")
     total_time_ms: float = Field(..., description="총 삭제 시간 (ms)")
 
+
+class DuplicateCheckRequest(BaseModel):
+    """중복 검사 요청"""
+    account_name: str = Field(..., description="계정명", example="chatty")
+    chat_bot_id: str = Field(..., description="챗봇 ID (UUID)", example="550e8400-e29b-41d4-a716-446655440000")
+    content_name: List[str] = Field(..., description="중복 검사할 문서 고유 식별자 리스트", min_items=1, example=["doc1", "doc2", "doc3"])
+
+
+class DuplicateCheckResponse(BaseModel):
+    """중복 검사 응답"""
+    status: str = Field(..., description="상태", example="success")
+    total_requested: int = Field(..., description="요청된 문서 수", example=3)
+    duplicate_count: int = Field(..., description="중복된 문서 수", example=2)
+    unique_count: int = Field(..., description="중복되지 않은 문서 수", example=1)
+    duplicate_content_names: List[str] = Field(..., description="중복된 문서 리스트", example=["doc1", "doc2"])
+    unique_content_names: List[str] = Field(..., description="중복되지 않은 문서 리스트", example=["doc3"])

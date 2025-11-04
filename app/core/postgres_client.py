@@ -112,8 +112,8 @@ class PostgresClient:
                 await conn.close()
                 return True
             
-            # 데이터베이스 생성
-            await conn.execute(f'CREATE DATABASE {db_name}')
+            # 데이터베이스 생성 (template0 사용 - collation 버전 문제 회피)
+            await conn.execute(f"CREATE DATABASE {db_name} WITH TEMPLATE template0")
             logger.info(f"✅ PostgreSQL 데이터베이스 생성 완료: {db_name}")
             
             await conn.close()
@@ -182,10 +182,17 @@ class PostgresClient:
             chunk_index INT NOT NULL,
             chunk_text TEXT NOT NULL,
             page_number INT,
+            content_hash VARCHAR(255) NULL DEFAULT NULL,
             PRIMARY KEY (chunk_id, chat_bot_id),
             FOREIGN KEY (doc_id, chat_bot_id) REFERENCES documents(doc_id, chat_bot_id) ON DELETE CASCADE,
             UNIQUE(doc_id, chat_bot_id, chunk_index)
         ) PARTITION BY LIST (chat_bot_id);
+        
+        -- document_chunks 메인 테이블 인덱스 추가
+        -- 1. content_hash 부분 인덱스 (NULL 제외, 효율성 향상)
+        CREATE INDEX IF NOT EXISTS idx_document_chunks_content_hash ON document_chunks(content_hash) WHERE content_hash IS NOT NULL;
+        -- 2. doc_id와 content_hash 복합 인덱스 (조합 쿼리 최적화)
+        CREATE INDEX IF NOT EXISTS idx_document_chunks_doc_id_content_hash ON document_chunks(doc_id, content_hash) WHERE content_hash IS NOT NULL;
         
         -- 4. 파티션 생성 함수
         CREATE OR REPLACE FUNCTION create_bot_partitions(p_bot_id VARCHAR)
@@ -223,6 +230,16 @@ class PostgresClient:
             
             EXECUTE format('
                 CREATE INDEX IF NOT EXISTS idx_%I_doc_id ON %I(doc_id)
+            ', chunks_partition_name, chunks_partition_name);
+            
+            -- content_hash 부분 인덱스 (NULL 제외, 효율성 향상)
+            EXECUTE format('
+                CREATE INDEX IF NOT EXISTS idx_%I_content_hash ON %I(content_hash) WHERE content_hash IS NOT NULL
+            ', chunks_partition_name, chunks_partition_name);
+            
+            -- doc_id와 content_hash 복합 인덱스 (조합 쿼리 최적화)
+            EXECUTE format('
+                CREATE INDEX IF NOT EXISTS idx_%I_doc_id_chash ON %I(doc_id, content_hash) WHERE content_hash IS NOT NULL
             ', chunks_partition_name, chunks_partition_name);
             
             RAISE NOTICE '파티션 생성 완료: % (bot_id: %)', documents_partition_name, p_bot_id;
@@ -335,7 +352,7 @@ class PostgresClient:
         account_name: str, 
         document_data: Dict[str, Any], 
         chunks: List[Dict[str, Any]]
-    ) -> int:
+    ) -> Optional[int]:
         """
         문서 + 청크를 단일 트랜잭션으로 삽입 (Saga Pattern용)
         
@@ -345,33 +362,55 @@ class PostgresClient:
             chunks: 청크 데이터 리스트
         
         Returns:
-            생성된 doc_id
+            생성된 doc_id (중복 시 None 반환)
         
         Note:
             PostgreSQL 트랜잭션으로 문서와 청크 삽입의 원자성 보장
+            중복 시 (chat_bot_id, content_name) 기존 doc_id 반환 또는 None
         """
         pool = await self.get_pool(account_name)
+        chat_bot_id = document_data.get("chat_bot_id")
+        content_name = document_data.get("content_name")
         
         async with pool.acquire() as conn:
             async with conn.transaction():
-                # 1. 문서 삽입
+                # 1. 문서 삽입 (중복 시 기존 doc_id 조회)
                 doc_id = await conn.fetchval("""
                     INSERT INTO documents (chat_bot_id, content_name, chunk_count, metadata)
                     VALUES ($1, $2, $3, $4::jsonb)
+                    ON CONFLICT (chat_bot_id, content_name) 
+                    DO NOTHING
                     RETURNING doc_id
                 """, 
-                    document_data.get("chat_bot_id"),
-                    document_data.get("content_name"),
+                    chat_bot_id,
+                    content_name,
                     len(chunks),
                     json.dumps(document_data.get("metadata", {}))
                 )
                 
+                # 중복 체크: doc_id가 None이면 중복된 문서이므로 기존 doc_id 조회
+                if doc_id is None:
+                    # 중복된 문서이므로 기존 doc_id 조회
+                    doc_id = await conn.fetchval("""
+                        SELECT doc_id FROM documents 
+                        WHERE chat_bot_id = $1 AND content_name = $2
+                    """, chat_bot_id, content_name)
+                    
+                    if doc_id is None:
+                        # 정말 문제가 있는 경우 (예상치 못한 오류)
+                        logger.error(f"❌ 문서 삽입 실패: doc_id가 None입니다. chat_bot_id={chat_bot_id}, content_name={content_name}")
+                        return None
+                    
+                    # 중복된 문서이므로 청크 삽입 스킵
+                    logger.warning(f"⚠️ 중복된 문서 발견 (트랜잭션 내): content_name='{content_name}', 기존 doc_id={doc_id}")
+                    return doc_id
+                
                 # 2. 청크 삽입
                 await conn.executemany("""
-                    INSERT INTO document_chunks (doc_id, chat_bot_id, chunk_index, chunk_text, page_number)
-                    VALUES ($1, $2, $3, $4, $5)
+                    INSERT INTO document_chunks (doc_id, chat_bot_id, chunk_index, chunk_text, page_number, content_hash)
+                    VALUES ($1, $2, $3, $4, $5, $6)
                 """, [
-                    (doc_id, document_data.get("chat_bot_id"), chunk["chunk_index"], chunk["text"], chunk.get("page_number"))
+                    (doc_id, chat_bot_id, chunk["chunk_index"], chunk["text"], chunk.get("page_number"), chunk.get("content_hash"))
                     for chunk in chunks
                 ])
                 
@@ -392,11 +431,11 @@ class PostgresClient:
             documents: 문서 데이터 리스트 (각 문서는 document_data, chunks 포함)
         
         Returns:
-            생성된 doc_id 리스트
+            생성된 doc_id 리스트 (중복 문서는 기존 doc_id 포함)
         
         Note:
             PostgreSQL 트랜잭션으로 모든 문서와 청크 삽입의 원자성 보장
-            하나라도 실패하면 전체 롤백
+            중복 문서는 기존 doc_id를 반환하고 청크 삽입 스킵
         """
         pool = await self.get_pool(account_name)
         doc_ids = []
@@ -404,25 +443,48 @@ class PostgresClient:
         async with pool.acquire() as conn:
             async with conn.transaction():
                 for doc_data in documents:
-                    # 1. 문서 삽입
+                    chat_bot_id = doc_data["document_data"].get("chat_bot_id")
+                    content_name = doc_data["document_data"].get("content_name")
+                    
+                    # 1. 문서 삽입 (중복 시 기존 doc_id 조회)
                     doc_id = await conn.fetchval("""
                         INSERT INTO documents (chat_bot_id, content_name, chunk_count, metadata)
                         VALUES ($1, $2, $3, $4::jsonb)
+                        ON CONFLICT (chat_bot_id, content_name) 
+                        DO NOTHING
                         RETURNING doc_id
                     """, 
-                        doc_data["document_data"].get("chat_bot_id"),
-                        doc_data["document_data"].get("content_name"),
+                        chat_bot_id,
+                        content_name,
                         len(doc_data["chunks"]),
                         json.dumps(doc_data["document_data"].get("metadata", {}))
                     )
+                    
+                    # 중복 체크: doc_id가 None이면 중복된 문서이므로 기존 doc_id 조회
+                    if doc_id is None:
+                        # 중복된 문서이므로 기존 doc_id 조회
+                        doc_id = await conn.fetchval("""
+                            SELECT doc_id FROM documents 
+                            WHERE chat_bot_id = $1 AND content_name = $2
+                        """, chat_bot_id, content_name)
+                        
+                        if doc_id is None:
+                            logger.error(f"❌ 문서 삽입 실패: doc_id가 None입니다. chat_bot_id={chat_bot_id}, content_name={content_name}")
+                            continue
+                        
+                        # 중복된 문서이므로 청크 삽입 스킵
+                        logger.warning(f"⚠️ 중복된 문서 발견 (배치 트랜잭션 내): content_name='{content_name}', 기존 doc_id={doc_id}")
+                        doc_ids.append(doc_id)
+                        continue
+                    
                     doc_ids.append(doc_id)
                     
                     # 2. 청크 삽입
                     await conn.executemany("""
-                        INSERT INTO document_chunks (doc_id, chat_bot_id, chunk_index, chunk_text, page_number)
-                        VALUES ($1, $2, $3, $4, $5)
+                        INSERT INTO document_chunks (doc_id, chat_bot_id, chunk_index, chunk_text, page_number, content_hash)
+                        VALUES ($1, $2, $3, $4, $5, $6)
                     """, [
-                        (doc_id, doc_data["document_data"].get("chat_bot_id"), chunk["chunk_index"], chunk["text"], chunk.get("page_number"))
+                        (doc_id, chat_bot_id, chunk["chunk_index"], chunk["text"], chunk.get("page_number"), chunk.get("content_hash"))
                         for chunk in doc_data["chunks"]
                     ])
                 
@@ -443,13 +505,13 @@ class PostgresClient:
         pool = await self.get_pool(account_name)
         
         query = """
-        INSERT INTO document_chunks (doc_id, chat_bot_id, chunk_index, chunk_text, page_number)
-        VALUES ($1, $2, $3, $4, $5)
+        INSERT INTO document_chunks (doc_id, chat_bot_id, chunk_index, chunk_text, page_number, content_hash)
+        VALUES ($1, $2, $3, $4, $5, $6)
         """
         async with pool.acquire() as conn:
             await conn.executemany(
                 query,
-                [(doc_id, chat_bot_id, chunk["chunk_index"], chunk["text"], chunk.get("page_number")) 
+                [(doc_id, chat_bot_id, chunk["chunk_index"], chunk["text"], chunk.get("page_number"), chunk.get("content_hash")) 
                  for chunk in chunks]
             )
         logger.info(f"청크 삽입 완료 (account: {account_name}, bot: {chat_bot_id}): doc_id={doc_id}, count={len(chunks)}")
@@ -833,7 +895,7 @@ class PostgresClient:
         logger.info(f"   - Account: {account_name}")
         logger.info(f"   - Bot ID: {chat_bot_id}")
         logger.info(f"   - 요청한 content_names: {len(content_names)}개")
-        logger.info(f"   - 요청한 content_names 값: {content_names}")
+        #logger.info(f"   - 요청한 content_names 값: {content_names}")
         
         async with pool.acquire() as conn:
             if len(content_names) == 1:
@@ -860,7 +922,7 @@ class PostgresClient:
                         else:
                             alternative_name = requested_name.replace('https://', 'http://', 1)
                         
-                        logger.info(f"🔄 URL 형식 감지, http/https 차이로 재검색: '{alternative_name}'")
+                        #logger.info(f"🔄 URL 형식 감지, http/https 차이로 재검색: '{alternative_name}'")
                         alt_query = """
                         SELECT content_name FROM documents 
                         WHERE chat_bot_id = $1 AND content_name = $2
@@ -871,8 +933,8 @@ class PostgresClient:
                             matched_name = alt_result['content_name']
                             logger.info(f"✅ 자동 매칭 (http/https): '{requested_name}' → '{matched_name}'")
                             return [matched_name]
-                        else:
-                            logger.warning(f"❌ http/https 교체 버전도 찾지 못함: '{alternative_name}'")
+                        #else:
+                            #logger.warning(f"❌ http/https 교체 버전도 찾지 못함: '{alternative_name}'")
                 
                 return []
             else:
@@ -891,7 +953,7 @@ class PostgresClient:
                 # 찾지 못한 content_names에 대해 URL 형식인 경우 http/https 차이만 자동 매칭
                 missing = set(content_names) - set(found_names)
                 if missing:
-                    logger.warning(f"❌ 찾지 못한 content_names: {missing}")
+                    #logger.warning(f"❌ 찾지 못한 content_names: {missing}")
                     
                     # 각 누락된 content_name에 대해 URL 형식인 경우만 http/https 매칭
                     for missing_name in missing:
@@ -903,7 +965,7 @@ class PostgresClient:
                             else:
                                 alternative_name = missing_name.replace('https://', 'http://', 1)
                             
-                            logger.info(f"🔄 URL 형식 감지, http/https 차이로 재검색: '{alternative_name}'")
+                            #logger.info(f"🔄 URL 형식 감지, http/https 차이로 재검색: '{alternative_name}'")
                             alt_query = """
                             SELECT content_name FROM documents 
                             WHERE chat_bot_id = $1 AND content_name = $2
@@ -918,8 +980,8 @@ class PostgresClient:
                                     found_names.append(matched_name)
                                 else:
                                     logger.warning(f"⚠️ 매칭된 content_name '{matched_name}'는 이미 다른 요청과 매칭됨")
-                            else:
-                                logger.warning(f"❌ http/https 교체 버전도 찾지 못함: '{alternative_name}'")
+                            # else:
+                            #     logger.warning(f"❌ http/https 교체 버전도 찾지 못함: '{alternative_name}'")
                 
                 return found_names
 

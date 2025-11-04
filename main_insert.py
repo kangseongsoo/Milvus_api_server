@@ -1,14 +1,14 @@
 """
-FastAPI 애플리케이션 진입점
-통합 서버 (삽입 + 검색)
-혹시 몰라 남겨놓지만 사용하지 않음
-main_insert.py와 main_search.py를 사용하세요
+FastAPI 삽입 서버 (Insert API Server)
+- 데이터 삽입/삭제 API
+- 컬렉션 관리 API
+- 자동 flush 기능
 """
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from contextlib import asynccontextmanager
 from app.config import settings
-from app.api import collection, data, search
+from app.api import collection, data
 from fastapi import APIRouter
 from app.utils.logger import setup_logger
 from app.core.partition_manager import partition_manager
@@ -24,13 +24,13 @@ async def lifespan(app: FastAPI):
     """FastAPI 생명주기 관리"""
     
     # ========== 시작 시 실행 ==========
-    logger.info("🚀 FastAPI Application Starting...")
+    logger.info("🚀 FastAPI Insert Server Starting...")
     
     try:
-        # Milvus 연결
+        # Milvus 연결 (milvus_client.py가 "default" alias 사용)
         from pymilvus import connections
         connections.connect(
-            alias="default",
+            alias="default",  # milvus_client.py와 일치해야 함
             host=settings.MILVUS_HOST,
             port=settings.MILVUS_PORT
         )
@@ -39,14 +39,16 @@ async def lifespan(app: FastAPI):
         # PostgreSQL 연결 테스트
         logger.info(f"✅ PostgreSQL Connected to ({settings.POSTGRES_HOST}:{settings.POSTGRES_PORT})")
         
-        # 파티션 매니저 초기화 (Redis 없이 Milvus 상태 직접 확인)
-        logger.info("✅ Partition manager initialized (Milvus state-based)")
+        # 모든 컬렉션 전체 로드 (시작 시 한 번만)
+        logger.info("🔄 Loading all collections...")
+        preload_result = await partition_manager.preload_all_collections()
+        logger.info(f"✅ All collections loaded: {preload_result['collections_loaded']} collections, {preload_result['total_partitions']} partitions")
         
-        # 자동 flush 백그라운드 태스크 시작
+        # 자동 flush 백그라운드 태스크 시작 (삽입 서버에만 필요)
         flush_task = asyncio.create_task(auto_flusher.start())
         logger.info(f"✅ Auto-flusher started (delay: {auto_flusher.delay_seconds}s, max_wait: {auto_flusher.max_wait_seconds}s)")
         
-        logger.info("🎉 FastAPI Application Ready!")
+        logger.info("🎉 FastAPI Insert Server Ready!")
         
     except Exception as e:
         logger.error(f"❌ Failed to initialize application: {e}")
@@ -55,7 +57,7 @@ async def lifespan(app: FastAPI):
     yield
     
     # ========== 종료 시 실행 ==========
-    logger.info("🛑 FastAPI Application Shutting Down...")
+    logger.info("🛑 FastAPI Insert Server Shutting Down...")
     
     try:
         # 파티션 매니저 정리 (Redis 없이 동작하므로 별도 종료 불필요)
@@ -87,13 +89,13 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logger.error(f"❌ Error during shutdown: {e}")
     
-    logger.info("👋 FastAPI Application Stopped")
+    logger.info("👋 FastAPI Insert Server Stopped")
 
 
 # FastAPI 앱 생성
 app = FastAPI(
-    title="Milvus RAG API Server",
-    description="RAG 시스템을 위한 Milvus + PostgreSQL 하이브리드 백엔드",
+    title="Milvus RAG API Server - Insert",
+    description="RAG 시스템을 위한 Milvus 데이터 삽입 서버 (Insert/Delete/Collection Management)",
     version="0.1.0",
     docs_url="/docs",
     redoc_url="/redoc",
@@ -109,10 +111,9 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# 라우터 등록
+# 삽입 서버 라우터 등록
 app.include_router(collection.router, prefix="/collection", tags=["Collection"])
 app.include_router(data.router, prefix="/data", tags=["Data"])
-app.include_router(search.router, prefix="/search", tags=["Search"])
 
 # 디버깅용 라우터
 debug_router = APIRouter()
@@ -136,12 +137,6 @@ async def get_partition_status():
         "collections_with_loaded_partitions": len(partition_manager.loaded_partitions),
         "loaded_partitions": all_partitions
     }
-
-@debug_router.post("/partitions/cleanup")
-async def trigger_cleanup():
-    """수동으로 정리 실행 (디버깅용)"""
-    # Redis 없이 동작하므로 cleanup 불필요
-    return {"message": "Cleanup not needed (Redis removed)"}
 
 @debug_router.get("/count/{collection_name}")
 async def count_entities(collection_name: str):
@@ -184,9 +179,12 @@ async def manual_flush(collection_name: str):
     except Exception as e:
         return {"message": str(e), "status": "error"}
 
+@debug_router.get("/flush/status")
+async def get_flush_status():
+    """Auto-flusher 상태 확인 (디버깅용)"""
+    return auto_flusher.get_status()
+
 app.include_router(debug_router, prefix="/debug", tags=["Debug"])
-
-
 
 
 @app.get("/")
@@ -194,7 +192,7 @@ async def root():
     """헬스 체크"""
     return {
         "status": "healthy",
-        "service": "Milvus RAG API Server",
+        "service": "Milvus RAG API Server - Insert",
         "version": "0.1.0"
     }
 
@@ -208,9 +206,11 @@ async def health_check():
         "collections_with_loaded_partitions": len(partition_manager.loaded_partitions),
         "collections": list(partition_manager.loaded_partitions.keys())
     }
+    flush_stats = auto_flusher.get_status()
     
     return {
         "status": "healthy",
+        "service": "insert",
         "milvus": {
             "host": settings.MILVUS_HOST,
             "port": settings.MILVUS_PORT
@@ -223,6 +223,6 @@ async def health_check():
             "model": settings.EMBEDDING_MODEL,
             "dimension": settings.EMBEDDING_DIMENSION
         },
-        "partitions": partition_stats
+        "partitions": partition_stats,
+        "auto_flusher": flush_stats
     }
-

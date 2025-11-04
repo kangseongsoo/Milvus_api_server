@@ -38,11 +38,22 @@ RAG(Retrieval-Augmented Generation) 시스템을 위한 **Milvus + PostgreSQL �
 
 ## 🏗️ 아키텍처
 
+### 서버 구조 (분리형)
+
 ```
-                          Milvus FastAPI 서버
-                                 ↓
-        ┌────────────────────────┴────────────────────────┐
-        ↓                                                 ↓
+                    클라이언트 요청
+                         ↓
+        ┌────────────────┴────────────────┐
+        ↓                                 ↓
+   삽입 서버 (8000)                  검색 서버 (8001)
+   - 데이터 삽입/삭제                  - 벡터 검색
+   - 컬렉션 관리                      - 읽기 전용
+   - Auto-flusher                    - 스케일 아웃 가능
+        ↓                                 ↓
+        └────────────────┬────────────────┘
+                         ↓
+        ┌────────────────┴────────────────┐
+        ↓                                 ↓
     Milvus (컬렉션별 격리)              PostgreSQL (파티셔닝)
     ├── news_bot_collection            rag_db_chatty
     ├── law_bot_collection             ├── documents (파티셔닝)
@@ -50,6 +61,17 @@ RAG(Retrieval-Augmented Generation) 시스템을 위한 **Milvus + PostgreSQL �
                                        │   ├── 법률봇 파티션 (300만)
                                        │   └── 의료봇 파티션 (300만)
                                        └── bot_registry
+                              Redis (파티션 상태 관리)
+```
+
+### 데이터 흐름
+
+```
+삽입 흐름:
+클라이언트 → 삽입 서버 (8000) → PostgreSQL + Milvus → Redis (상태 저장)
+
+검색 흐름:
+클라이언트 → 검색 서버 (8001) → Redis (파티션 확인) → Milvus (검색) → PostgreSQL (메타데이터) → 결과 반환
 ```
 
 **파티셔닝의 장점**:
@@ -112,34 +134,72 @@ docker run -d --name milvus-standalone \
 
 ### 3. 서버 실행
 
+#### 옵션 1: 분리된 서버 실행 (권장) ⚡
+
+**삽입 서버** (데이터 삽입/삭제, 컬렉션 관리):
 ```bash
-# 개발 서버 실행
+# 삽입 서버 실행 (포트 8000)
+uvicorn main_insert:app --reload --host 0.0.0.0 --port 8000
+
+# 또는
+python -m uvicorn main_insert:app --reload --port 8000
+```
+
+**검색 서버** (벡터 검색):
+```bash
+# 검색 서버 실행 (포트 8001)
+uvicorn main_search:app --reload --host 0.0.0.0 --port 8001
+
+# 또는
+python -m uvicorn main_search:app --reload --port 8001
+```
+
+**분리 실행의 장점**:
+- ✅ 독립적 스케일링 (검색 서버만 여러 개 실행 가능)
+- ✅ 장애 격리 (삽입 서버 문제가 검색에 영향 없음)
+- ✅ 리소스 최적화 (검색 서버는 읽기 전용 최적화)
+
+#### 옵션 2: 통합 서버 실행 (기존 방식)
+
+```bash
+# 모든 API가 하나의 서버에서 실행
 uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
 
 # 또는
 python -m uvicorn app.main:app --reload
 ```
 
-서버가 실행되면:
-- API 문서: http://localhost:8000/docs
-- ReDoc: http://localhost:8000/redoc
-- 헬스 체크: http://localhost:8000/health
+**서버 접속 정보**:
+
+| 서버 | 포트 | API 문서 | 헬스 체크 |
+|------|------|----------|-----------|
+| 삽입 서버 | 8000 | http://localhost:8000/docs | http://localhost:8000/health |
+| 검색 서버 | 8001 | http://localhost:8001/docs | http://localhost:8001/health |
+| 통합 서버 | 8000 | http://localhost:8000/docs | http://localhost:8000/health |
 
 ## 📚 API 문서
 
-### 봇 등록 및 컬렉션 관리
-- `POST /collection/create` - 봇 등록 + Milvus 컬렉션 생성 + PostgreSQL 파티션 자동 생성
+### 삽입 서버 API (포트 8000)
 
-### 데이터 관리 (CRUD)
+#### 봇 등록 및 컬렉션 관리
+- `POST /collection/create` - 봇 등록 + Milvus 컬렉션 생성 + PostgreSQL 파티션 자동 생성
+- `POST /collection/register-bot` - 새로운 봇 등록 (파티션 자동 생성)
+
+#### 데이터 관리 (CRUD)
+- `POST /data/check-duplicates` - 중복 검사
 - `POST /data/insert` - 단일 문서 삽입
 - `POST /data/insert/batch` - 여러 문서 일괄 삽입 (권장!) ⚡
+- `POST /data/insert/batch/with-embeddings` - 임베딩 포함 배치 삽입
 - `GET /data/document/{doc_id}?chat_bot_id=xxx` - 문서 조회
 - `PUT /data/document/{doc_id}` - 문서 전체 업데이트
 - `PATCH /data/document/{doc_id}/metadata` - 메타데이터만 업데이트
 - `DELETE /data/document/{doc_id}?chat_bot_id=xxx` - 문서 삭제
 - `POST /data/document/delete/batch` - 여러 문서 일괄 삭제
+- `DELETE /data/bot/{chat_bot_id}` - 봇 삭제 (모든 문서 삭제)
 
-### 검색
+### 검색 서버 API (포트 8001)
+
+#### 검색
 - `POST /search/query` - 유사도 검색 (파티션 프루닝 적용)
 
 ### API 예시
